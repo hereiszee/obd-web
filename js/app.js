@@ -253,6 +253,12 @@ function updateButtons() {
   else setMsg($('liveMsg'), null, null, null);
 }
 
+function errMsg(e) {
+  if (e === null || e === undefined) return 'unknown error';
+  if (typeof e !== 'object') return 'code ' + String(e);
+  return (e.message || String(e));
+}
+
 // Wraps a long action: disables conflicting buttons, catches errors, shows plain English.
 function run(label, fn, errorEl, onError) {
   if (S.busy) return Promise.resolve();
@@ -262,7 +268,8 @@ function run(label, fn, errorEl, onError) {
   return Promise.resolve()
     .then(fn)
     .catch(function (e) {
-      logger.log('error', label + ' failed: ' + ((e && e.stack) || e));
+      logger.log('error', label + ' failed: ' + errMsg(e));
+      if (e && e.stack) logger.log('info', 'Stack: ' + e.stack);
       if (errorEl) setMsgOrAppend(errorEl, 'bad', label + ' did not finish', friendlyError(e));
       if (onError) { try { onError(e); } catch (e2) { /* ignore */ } }
     })
@@ -389,10 +396,19 @@ function talkToCar() {
       .then(function (sup) {
         if (stale()) return;
         S.supported = sup && sup.all ? sup : { all: new Set(), byEcu: {} };
+        try {
+          var ecus = Object.keys(S.supported.byEcu || {}).sort();
+          logger.log('info', 'Modules answering: ' + (ecus.length ? ecus.map(function (id) {
+            var set = S.supported.byEcu[id];
+            return id + ' ' + ecuLabel(id) + ' (' + (set ? set.size : 0) + ' readings)';
+          }).join(', ') : 'none'));
+          logger.log('info', 'Supported readings (all modules): ' + Array.from(S.supported.all).sort(function (a, b) { return a - b; }).map(function (n) { return (n < 16 ? '0' : '') + n.toString(16).toUpperCase(); }).join(' '));
+        } catch (e) { /* logging only */ }
         var sim = S.kind === 'sim' ? ' (simulated car)' : '';
         setStatus('ok', 'Connected to the car' + sim + '. Everything below is ready to use.', S.kind === 'sim' ? 'Simulated car' : 'Connected');
         setMsg($('connectMsg'), 'ok', null, 'Next: run the Used car check, or read the trouble codes.');
-        setupLive();
+        if (!S.reconnecting) setupLive();
+        if (S.kind === 'ble') keepAwake(true);
       });
   });
 }
@@ -444,8 +460,15 @@ function onDisconnectClick() {
 function onTransportLost(t, reason) {
   if (S.transport !== t) return;
   var user = S.userDisconnecting;
+  // A drop while auto-reconnecting is handled by the retry loop itself.
+  if (S.reconnecting && !user) return;
+  var wasLive = S.live.running;
   S.live.running = false;
   try { if (S.elm) S.elm.cancelAll(); } catch (e) { /* ignore */ }
+  if (!user && S.kind === 'ble' && typeof t.reconnect === 'function' && !S.reconnecting) {
+    autoReconnect(t, wasLive, reason);
+    return;
+  }
   if (user) {
     dropTransport(t, 'Disconnected. You can unplug the adapter now.', 'idle');
   } else {
@@ -455,6 +478,96 @@ function onTransportLost(t, reason) {
   }
 }
 
+var RECONNECT_DELAYS = [700, 1500, 3000, 5000];
+
+// After an unexpected Bluetooth drop: reconnect to the same adapter, set it up again and
+// carry on (including live data) without the user doing anything.
+function autoReconnect(t, wasLive, reason) {
+  S.reconnecting = true;
+  S.connected = false;
+  S.adapterOnly = false;
+  var keepSel = S.live.selected.slice();
+  logger.log('warn', 'Connection dropped' + (reason ? ' (' + reason + ')' : '') + '. Trying to reconnect automatically.');
+  updateButtons();
+  var attempt = 0;
+  function aborted() { return S.userDisconnecting || S.transport !== t; }
+  function waitIdle(ms) {
+    return new Promise(function (resolve) {
+      var waited = 0;
+      (function tick() {
+        if (!S.busy || waited >= ms) return resolve();
+        waited += 100;
+        setTimeout(tick, 100);
+      })();
+    });
+  }
+  function next() {
+    if (aborted()) { S.reconnecting = false; return; }
+    if (attempt >= RECONNECT_DELAYS.length) {
+      S.reconnecting = false;
+      logger.log('error', 'Could not reconnect after ' + attempt + ' tries.');
+      dropTransport(t, 'The adapter disconnected.', 'bad');
+      setMsg($('connectMsg'), 'bad', 'Connection lost',
+        'The app tried to reconnect ' + attempt + ' times without luck. Check the car is still ON or in READY and the adapter light is on, then tap Connect adapter. Your results so far are kept.');
+      return;
+    }
+    var delay = RECONNECT_DELAYS[attempt];
+    attempt++;
+    setStatus('busy', 'The Bluetooth link dropped. Reconnecting (try ' + attempt + ' of ' + RECONNECT_DELAYS.length + ')... Keep the phone near the car.', 'Reconnecting...');
+    setTimeout(function () {
+      if (aborted()) { S.reconnecting = false; return; }
+      waitIdle(6000).then(function () {
+        if (aborted()) { S.reconnecting = false; return; }
+        S.busy = true;
+        updateButtons();
+        return t.reconnect().then(function () {
+          if (aborted()) return 'aborted';
+          S.elm = new Elm327(t, logger);
+          S.obd = new Obd(S.elm);
+          return talkToCar().then(function () { return 'done'; });
+        });
+      }).then(function (res) {
+        S.busy = false;
+        S.reconnecting = false;
+        if (res !== 'done') { updateButtons(); return; }
+        if (!S.connected) { updateButtons(); return; }
+        // Keep the readings the user picked.
+        var avail = supportedLivePids();
+        var sel = keepSel.filter(function (p) { return avail.indexOf(p) >= 0; });
+        if (sel.length) { S.live.selected = sel; renderPicker(avail); renderTiles(); }
+        setMsg($('connectMsg'), 'ok', 'Reconnected', 'The Bluetooth link dropped for a moment and the app reconnected by itself.' + (wasLive ? ' Live data has restarted.' : ''));
+        updateButtons();
+        if (wasLive) onLiveToggle();
+      }, function (e) {
+        S.busy = false;
+        updateButtons();
+        logger.log('warn', 'Reconnect try ' + attempt + ' failed: ' + errMsg(e));
+        S.reconnecting = true;
+        next();
+      });
+    }, delay);
+  }
+  next();
+}
+
+// Keep the screen on while connected. iOS can drop Bluetooth when the phone locks.
+var wakeLock = null;
+function keepAwake(on) {
+  try {
+    if (on) {
+      if (wakeLock || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+      navigator.wakeLock.request('screen').then(function (l) {
+        wakeLock = l;
+        logger.log('info', 'Screen will stay on while connected.');
+        l.addEventListener('release', function () { wakeLock = null; });
+      }, function (e) { logger.log('info', 'Screen wake lock not available: ' + errMsg(e)); });
+    } else if (wakeLock) {
+      var l = wakeLock; wakeLock = null;
+      l.release().catch(function () {});
+    }
+  } catch (e) { /* not supported */ }
+}
+
 function dropTransport(t, text, kind) {
   if (t && S.transport && S.transport !== t) return;
   S.transport = null;
@@ -462,7 +575,9 @@ function dropTransport(t, text, kind) {
   S.obd = null;
   S.connected = false;
   S.adapterOnly = false;
+  S.reconnecting = false;
   S.live.running = false;
+  keepAwake(false);
   setStatus(kind || 'idle', text);
   show($('connectInfo'), false);
   updateButtons();
@@ -1249,6 +1364,9 @@ function bind() {
   $('btnReadiness').addEventListener('click', onReadiness);
   $('btnFreeze').addEventListener('click', onFreeze);
   $('btnLive').addEventListener('click', onLiveToggle);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && S.connected && S.kind === 'ble') keepAwake(true);
+  });
   $('btnReport').addEventListener('click', onBuildReport);
   $('btnShare').addEventListener('click', onShare);
   $('btnCopyReport').addEventListener('click', function () { doCopyReport(); });

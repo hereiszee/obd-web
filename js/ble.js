@@ -23,8 +23,9 @@ export const CANDIDATE_SERVICES = [
 
 // Known notify/write pairs, in order of preference.
 var KNOWN_PAIRS = [
-  { service: uuid16(0x18f0), notify: uuid16(0x2af0), write: uuid16(0x2af1) },
+  // Proven on a real vLinker MC-IOS (Bluefy, Nov 2026).
   { service: 'e7810a71-73ae-499d-8c15-faa9aef0c3f2', notify: 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f', write: 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f' },
+  { service: uuid16(0x18f0), notify: uuid16(0x2af0), write: uuid16(0x2af1) },
   { service: uuid16(0xfff0), notify: uuid16(0xfff1), write: uuid16(0xfff2) },
   { service: uuid16(0xffe0), notify: uuid16(0xffe1), write: uuid16(0xffe1) },
   { service: '6e400001-b5a3-f393-e0a9-e50e24dcca9e', notify: '6e400003-b5a3-f393-e0a9-e50e24dcca9e', write: '6e400002-b5a3-f393-e0a9-e50e24dcca9e' },
@@ -76,8 +77,22 @@ function encodeAscii(text) {
   return arr;
 }
 
+// Bluefy reports 16-bit UUIDs in short form ('18f0'). Expand so comparisons work everywhere.
+export function normUuid(u) {
+  var x = String(u || '').toLowerCase();
+  if (/^[0-9a-f]{4}$/.test(x)) return '0000' + x + '-0000-1000-8000-00805f9b34fb';
+  if (/^[0-9a-f]{8}$/.test(x)) return x + '-0000-1000-8000-00805f9b34fb';
+  return x;
+}
+
+function shortUuid(u) {
+  var m = /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/.exec(u);
+  return m ? m[1] : u;
+}
+
 function errText(e) {
-  if (!e) return 'unknown error';
+  if (e === null || e === undefined) return 'unknown error';
+  if (typeof e !== 'object') return 'code ' + String(e);
   return (e.name ? e.name + ': ' : '') + (e.message || String(e));
 }
 
@@ -125,6 +140,10 @@ export class BleTransport {
       });
     } catch (e) {
       this._logger.log('warn', 'Device picker closed or failed: ' + errText(e));
+      // Bluefy rejects with a bare number (not an Error) when the list is closed without a choice.
+      if (e === null || e === undefined || typeof e !== 'object') {
+        throw new Error('The device list closed without a choice. Tap Connect again and pick your adapter (for example "vLinker").');
+      }
       // Chrome and Bluefy also use NotFoundError when the Bluetooth radio is off or missing.
       if (e && /adapter not available|bluetooth.*(off|unavailable|not available|disabled)|radio/i.test(String(e.message || ''))) {
         throw new Error('Bluetooth is turned off. Turn it on, then tap Connect again.');
@@ -146,7 +165,7 @@ export class BleTransport {
     device.addEventListener('gattserverdisconnected', this._onGattDisconnect);
 
     try {
-      await this._setup(device);
+      await this._setupWithRetry(device);
     } catch (e) {
       this._logger.log('error', 'BLE setup failed: ' + errText(e));
       if (e && e.stack) this._logger.log('error', e.stack);
@@ -156,6 +175,44 @@ export class BleTransport {
       if (e && e.userMessage) throw new Error(e.userMessage);
       throw new Error('Could not talk to the adapter. Make sure it is plugged in, the ignition is on, and no other app is connected to it. Then try again.');
     }
+    return this.info;
+  }
+
+  // Runs _setup, retrying once if the link drops (the vLinker sometimes drops during discovery).
+  async _setupWithRetry(device) {
+    try {
+      await this._setup(device);
+    } catch (first) {
+      if (this._userDisconnect) throw first;
+      this._logger.log('warn', 'Setup failed (' + errText(first) + '). Retrying once...');
+      this._teardown();
+      try { if (device.gatt && device.gatt.connected) device.gatt.disconnect(); } catch (e3) { /* ignore */ }
+      await new Promise(function (r) { setTimeout(r, 800); });
+      await this._setup(device);
+    }
+    // A drop during setup marks the disconnect as reported. Reset so later drops reach the app.
+    this._disconnectReported = false;
+  }
+
+  // Reconnects to the same adapter after an unexpected drop. No device list, no tap needed.
+  async reconnect() {
+    var device = this._device;
+    if (!device) throw new Error('No adapter to reconnect to.');
+    this._userDisconnect = false;
+    this._disconnectReported = false;
+    this._teardown();
+    try { device.removeEventListener('gattserverdisconnected', this._onGattDisconnect); } catch (e) { /* ignore */ }
+    device.addEventListener('gattserverdisconnected', this._onGattDisconnect);
+    this._logger.log('info', 'Reconnecting to ' + (device.name || 'adapter') + '...');
+    try {
+      await this._setupWithRetry(device);
+    } catch (e) {
+      this._teardown();
+      try { if (device.gatt && device.gatt.connected) device.gatt.disconnect(); } catch (e2) { /* ignore */ }
+      this._disconnectReported = false;
+      throw e;
+    }
+    this._logger.log('info', 'Reconnected.');
     return this.info;
   }
 
@@ -191,35 +248,65 @@ export class BleTransport {
         } catch (e) { /* not present */ }
       }
     }
-    this._logger.log('info', 'Found ' + services.length + ' accessible service(s).');
+    var svcByUuid = {};
+    var svcNames = [];
+    for (var si = 0; si < services.length; si++) {
+      var nu = normUuid(services[si].uuid);
+      svcByUuid[nu] = services[si];
+      svcNames.push(shortUuid(nu));
+    }
+    this._logger.log('info', 'Found ' + services.length + ' accessible service(s): ' + svcNames.join(', '));
 
     var chars = [];
     var all = [];
-    for (var s = 0; s < services.length; s++) {
-      var svc = services[s];
-      var svcUuid = String(svc.uuid).toLowerCase();
+    var self = this;
+    var listed = {};
+    // Lists one service's characteristics. Returns false if listing failed.
+    async function listService(svcUuid) {
+      if (listed[svcUuid]) return true;
+      listed[svcUuid] = true;
       var entry = { uuid: svcUuid, characteristics: [] };
       all.push(entry);
-      this._logger.log('info', 'Service ' + svcUuid);
-      var list = [];
+      self._logger.log('info', 'Service ' + shortUuid(svcUuid));
+      var list;
       try {
-        list = await svc.getCharacteristics();
+        list = await svcByUuid[svcUuid].getCharacteristics();
       } catch (e) {
-        this._logger.log('warn', '  could not list characteristics: ' + errText(e));
-        continue;
+        self._logger.log('warn', '  could not list characteristics: ' + errText(e));
+        return false;
       }
       for (var c = 0; c < list.length; c++) {
         var ch = list[c];
         var pr = propsOf(ch);
-        var cu = String(ch.uuid).toLowerCase();
+        var cu = normUuid(ch.uuid);
         entry.characteristics.push({ uuid: cu, properties: propsText(pr) });
-        this._logger.log('info', '  Characteristic ' + cu + ' [' + propsText(pr) + ']');
+        self._logger.log('info', '  Characteristic ' + shortUuid(cu) + ' [' + propsText(pr) + ']');
         chars.push({ service: svcUuid, uuid: cu, ch: ch, props: pr });
       }
+      return true;
+    }
+
+    // Fast path: open only the known adapter services, in order of preference, and stop at the
+    // first usable pair. Listing every service is slow and the vLinker can drop the link meanwhile.
+    var pick = null;
+    for (var k = 0; k < KNOWN_PAIRS.length && !pick; k++) {
+      if (!svcByUuid[KNOWN_PAIRS[k].service]) continue;
+      await listService(KNOWN_PAIRS[k].service);
+      pick = this._choose(chars);
+    }
+    // Slow path: list everything else and pick the best match.
+    if (!pick) {
+      for (var u in svcByUuid) {
+        if (!server.connected) break;
+        await listService(u);
+      }
+      pick = this._choose(chars);
     }
     this.info.allServices = all;
+    if (!server.connected) {
+      throw new Error('The adapter dropped the Bluetooth link during setup');
+    }
 
-    var pick = this._choose(chars);
     if (!pick) {
       var err = new Error('No usable notify and write characteristics found');
       err.userMessage = 'Connected, but this device does not look like an OBD adapter. Check you picked the right device (for example "vLinker") and try again.';

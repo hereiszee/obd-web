@@ -166,6 +166,21 @@ export async function run() {
     assert.equal(await runReconnect(), true);
   });
 
+  test('keepalive sends ATRV only while idle, and stops', async () => {
+    const tr = new ReplayTransport();
+    const sent = [];
+    const w = tr.write.bind(tr);
+    tr.write = (x) => { sent.push(x.trim()); return w(x); };
+    const elm = new Elm327(tr, new Logger());
+    elm.startKeepAlive(1200);
+    await new Promise((r) => setTimeout(r, 2600));
+    const n = sent.filter((c) => c === 'ATRV').length;
+    elm.stopKeepAlive();
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.ok(n >= 1, 'expected a keepalive ATRV');
+    assert.equal(sent.filter((c) => c === 'ATRV').length, n, 'no keepalive after stop');
+  });
+
   let passed = 0, failed = 0;
   for (const t of tests) {
     try { await t.fn(); passed++; console.log('ok   ' + t.name); }

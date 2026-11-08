@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js';
-import { BleTransport } from './ble.js';
-import { SimTransport } from './sim.js';
-import { Elm327 } from './elm.js';
-import { Obd, ecuLabel } from './obd.js';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js';
-import { describeDtc } from './dtc-db.js';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js';
-import { buildReport } from './report.js';
+import { logger } from './log.js?v=1.0.2';
+import { BleTransport } from './ble.js?v=1.0.2';
+import { SimTransport } from './sim.js?v=1.0.2';
+import { Elm327 } from './elm.js?v=1.0.2';
+import { Obd, ecuLabel } from './obd.js?v=1.0.2';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.2';
+import { describeDtc } from './dtc-db.js?v=1.0.2';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.2';
+import { buildReport } from './report.js?v=1.0.2';
 
-var APP_VERSION = '1.0.0';
+var APP_VERSION = '1.0.2';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -408,7 +408,7 @@ function talkToCar() {
         setStatus('ok', 'Connected to the car' + sim + '. Everything below is ready to use.', S.kind === 'sim' ? 'Simulated car' : 'Connected');
         setMsg($('connectMsg'), 'ok', null, 'Next: run the Used car check, or read the trouble codes.');
         if (!S.reconnecting) setupLive();
-        if (S.kind === 'ble') keepAwake(true);
+        if (S.kind === 'ble') { keepAwake(true); if (S.elm) S.elm.startKeepAlive(4000); }
       });
   });
 }
@@ -463,6 +463,11 @@ function onTransportLost(t, reason) {
   // A drop while auto-reconnecting is handled by the retry loop itself.
   if (S.reconnecting && !user) return;
   var wasLive = S.live.running;
+  try {
+    var idle = S.elm ? Math.round(S.elm.idleMs() / 100) / 10 : null;
+    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + '.');
+  } catch (e) { /* logging only */ }
+  try { if (S.elm) S.elm.stopKeepAlive(); } catch (e) { /* ignore */ }
   S.live.running = false;
   try { if (S.elm) S.elm.cancelAll(); } catch (e) { /* ignore */ }
   if (!user && S.kind === 'ble' && typeof t.reconnect === 'function' && !S.reconnecting) {
@@ -570,6 +575,7 @@ function keepAwake(on) {
 
 function dropTransport(t, text, kind) {
   if (t && S.transport && S.transport !== t) return;
+  try { if (S.elm) S.elm.stopKeepAlive(); } catch (e) { /* ignore */ }
   S.transport = null;
   S.elm = null;
   S.obd = null;
@@ -1365,6 +1371,7 @@ function bind() {
   $('btnFreeze').addEventListener('click', onFreeze);
   $('btnLive').addEventListener('click', onLiveToggle);
   document.addEventListener('visibilitychange', function () {
+    logger.log('info', 'Page is now ' + document.visibilityState + (document.visibilityState === 'hidden' ? ' (phone locked or another app in front). iOS may drop Bluetooth while hidden.' : '.'));
     if (document.visibilityState === 'visible' && S.connected && S.kind === 'ble') keepAwake(true);
   });
   $('btnReport').addEventListener('click', onBuildReport);

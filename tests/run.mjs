@@ -82,10 +82,26 @@ async function runImportChecks() {
       new Function(body);
     }
   });
+  await test('all local imports carry the same ?v= version stamp', () => {
+    const stamps = new Set();
+    const html = readFileSync(join(root, 'index.html'), 'utf8');
+    for (const m of html.matchAll(/(?:src|href)="(?:js|css)\/[^"]*\?v=([^"]+)"/g)) stamps.add(m[1]);
+    for (const f of readdirSync(join(root, 'js')).filter((x) => x.endsWith('.js'))) {
+      const src = readFileSync(join(root, 'js', f), 'utf8');
+      for (const m of src.matchAll(/from '\.\/[^']+'/g)) {
+        const v = /\?v=([^']+)'/.exec(m[0]);
+        assert.ok(v, f + ' has an unversioned import: ' + m[0] + ' (run sh tools/bump-version.sh)');
+        stamps.add(v[1]);
+      }
+    }
+    const app = readFileSync(join(root, 'js', 'app.js'), 'utf8');
+    stamps.add((/APP_VERSION = '([^']+)'/.exec(app) || [])[1]);
+    assert.equal(stamps.size, 1, 'mixed version stamps: ' + [...stamps].join(', '));
+  });
   await test('index.html references existing files', () => {
     const html = readFileSync(join(root, 'index.html'), 'utf8');
     const refs = [];
-    html.replace(/(?:src|href)="([^"#:]+)"/g, (m, p) => { refs.push(p); return m; });
+    html.replace(/(?:src|href)="([^"#:]+)"/g, (m, p) => { refs.push(p.replace(/\?.*$/, '')); return m; });
     assert.ok(refs.some((r) => /js\/app\.js$/.test(r)), 'index.html does not load js/app.js');
     for (const r of refs) {
       assert.ok(!r.startsWith('/'), 'absolute path in index.html: ' + r);

@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js';
+import { logger as defaultLogger } from './log.js?v=1.0.2';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -115,6 +115,8 @@ export class Elm327 {
     this.elmVersion = null;
     this.protocol = null;
     this.protocolNumber = null;
+    this._lastActivity = Date.now();
+    this._keepAliveTimer = null;
     var self = this;
     if (transport) {
       transport.onData = function (chunk) { self._onData(chunk); };
@@ -144,6 +146,7 @@ export class Elm327 {
     this._busy = true;
     var job = this._queue.shift();
     var self = this;
+    this._lastActivity = Date.now();
     this._run(job).then(function (res) {
       return res;
     }, function (e) {
@@ -153,6 +156,7 @@ export class Elm327 {
       job.resolve(res);
       return res.status === 'timeout' ? self._resync() : null;
     }).then(null, function () { /* resync errors are logged inside */ }).then(function () {
+      self._lastActivity = Date.now();
       self._busy = false;
       self._pump();
     });
@@ -295,6 +299,30 @@ export class Elm327 {
     }
   }
 
+  // Milliseconds since the adapter last had a command in flight.
+  idleMs() {
+    return (this._busy || this._queue.length) ? 0 : Date.now() - this._lastActivity;
+  }
+
+  // Some BLE adapters drop the link after a few seconds without traffic. When the queue
+  // has been idle for `everyMs`, send a harmless ATRV (battery voltage) to keep it awake.
+  startKeepAlive(everyMs) {
+    var self = this;
+    var ms = everyMs || 4000;
+    this.stopKeepAlive();
+    this._keepAliveTimer = setInterval(function () {
+      var t = self.transport;
+      if (!t || (t.isConnected && !t.isConnected())) return;
+      if (self.idleMs() < ms) return;
+      self.send('ATRV', { timeout: 2000 });
+    }, 1000);
+  }
+
+  stopKeepAlive() {
+    if (this._keepAliveTimer) clearInterval(this._keepAliveTimer);
+    this._keepAliveTimer = null;
+  }
+
   cancelAll() {
     var queued = this._queue;
     this._queue = [];
@@ -316,10 +344,18 @@ export class Elm327 {
     this._headersOn = false;
     this.logger.log('info', 'Initialising adapter...');
 
-    var z = await this.send('ATZ', { timeout: 5000 });
-    if (z.status === 'timeout') {
-      this.logger.log('warn', 'No reply to ATZ, trying once more.');
+    // ATWS (warm start) resets the ELM settings like ATZ but skips the full hardware reset.
+    // A full ATZ once coincided with the vLinker dropping the Bluetooth link. Fall back to ATZ
+    // on adapters that do not know ATWS.
+    var z = await this.send('ATWS', { timeout: 5000 });
+    if (z.status !== 'ok' || !findVersion(z.lines)) {
+      if (z.status === 'stopped') { result.message = 'Lost connection to the adapter while setting it up.'; return result; }
+      this.logger.log('info', 'ATWS not accepted (' + z.status + '), using ATZ.');
       z = await this.send('ATZ', { timeout: 5000 });
+      if (z.status === 'timeout') {
+        this.logger.log('warn', 'No reply to ATZ, trying once more.');
+        z = await this.send('ATZ', { timeout: 5000 });
+      }
     }
     result.elmVersion = findVersion(z.lines);
 

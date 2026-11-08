@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js';
-import { describeDtc } from './dtc-db.js';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.2';
+import { describeDtc } from './dtc-db.js?v=1.0.2';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -848,7 +848,7 @@ export class Obd {
       { pid: 0x30, key: 'warmupsSinceClear', label: 'Warm-ups since codes were cleared' },
       { pid: 0x21, key: 'distanceWithMil', label: 'Distance driven with the check engine light on' },
       { pid: 0x4d, key: 'timeWithMil', label: 'Engine run time with the check engine light on' },
-      { pid: 0xa6, key: 'odometer', label: 'Odometer (from the engine computer)', onlyIfSupported: true }
+      { pid: 0xa6, key: 'odometer', label: 'Odometer (from the car computers)', onlyIfSupported: true }
     ];
     const items = [];
     const vals = {};
@@ -957,7 +957,7 @@ export function buildUsedCarFlags(d) {
   }
 
   if (typeof vals.odometer === 'number') {
-    flags.push({ level: 'info', text: 'Odometer stored in the engine computer: ' + vals.odometer + ' km. Compare it with the dashboard reading.' });
+    flags.push({ level: 'info', text: 'Odometer stored in the car computers: ' + vals.odometer + ' km. Compare it with the dashboard reading.' });
   }
 
   if (d.vin && d.vin.vin) flags.push({ level: 'info', text: 'VIN reported by the car: ' + d.vin.vin + '. Check it matches the plate on the car and the paperwork.' });

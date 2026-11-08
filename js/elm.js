@@ -15,7 +15,11 @@ var MESSAGES = {
   bufferfull: 'The adapter received more data than it could hold. Some of the answer may be missing.'
 };
 
-var POST_TIMEOUT_DRAIN_MS = 300;
+// After a timeout the ELM327 may still be busy (searching, slow ECU). We send a lone CR to
+// interrupt it, then throw away everything up to its '>' prompt (and any straggling prompt
+// that follows within RESYNC_QUIET_MS) before the next command is written.
+var RESYNC_DEADLINE_MS = 2000;
+var RESYNC_QUIET_MS = 250;
 
 function norm(s) {
   return String(s).replace(/\s+/g, '').toUpperCase();
@@ -23,10 +27,6 @@ function norm(s) {
 
 function isAtCommand(cmd) {
   return /^AT/i.test(String(cmd).trim());
-}
-
-function delay(ms) {
-  return new Promise(function (r) { setTimeout(r, ms); });
 }
 
 // Classify one cleaned line. Returns a status string or null if it is a normal data line.
@@ -150,10 +150,9 @@ export class Elm327 {
       self.logger.log('error', 'Command ' + job.cmd + ' failed: ' + (e && e.message ? e.message : String(e)));
       return self._result(job.cmd, '', [], 'stopped');
     }).then(function (res) {
-      var after = res.status === 'timeout' ? delay(POST_TIMEOUT_DRAIN_MS) : Promise.resolve();
       job.resolve(res);
-      return after;
-    }).then(function () {
+      return res.status === 'timeout' ? self._resync() : null;
+    }).then(null, function () { /* resync errors are logged inside */ }).then(function () {
       self._busy = false;
       self._pump();
     });
@@ -218,6 +217,52 @@ export class Elm327 {
     });
   }
 
+  // Bring the adapter back to a known idle state after a timed-out command.
+  _resync() {
+    var self = this;
+    var t = this.transport;
+    if (!t || (typeof t.isConnected === 'function' && !t.isConnected())) return Promise.resolve();
+    return new Promise(function (resolve) {
+      var done = false;
+      var quiet = null;
+      var deadline = null;
+      var sink = {
+        cmd: '(resync)',
+        buffer: '',
+        finish: function () {
+          if (done) return;
+          done = true;
+          if (quiet) clearTimeout(quiet);
+          if (deadline) clearTimeout(deadline);
+          if (self._current === sink) self._current = null;
+          resolve();
+        },
+        onChunk: function () {
+          // After the first prompt, keep swallowing data until the line goes quiet.
+          if (quiet) { clearTimeout(quiet); quiet = setTimeout(sink.finish, RESYNC_QUIET_MS); }
+        },
+        onPrompt: function (raw) {
+          self.logger.log('rx', raw + '> (discarded after timeout)');
+          if (quiet) clearTimeout(quiet);
+          quiet = setTimeout(sink.finish, RESYNC_QUIET_MS);
+        }
+      };
+      self._current = sink;
+      deadline = setTimeout(function () {
+        self.logger.log('warn', 'The adapter did not return to its prompt after a timeout. Continuing anyway.');
+        sink.finish();
+      }, RESYNC_DEADLINE_MS);
+      self.logger.log('info', 'Resynchronising with the adapter after a timeout.');
+      self.logger.log('tx', '(CR to interrupt the adapter)');
+      Promise.resolve().then(function () {
+        return t.write('\r');
+      }).then(null, function (e) {
+        self.logger.log('warn', 'Resync write failed: ' + (e && e.message ? e.message : String(e)));
+        sink.finish();
+      });
+    });
+  }
+
   _noteState(cmd, parsed) {
     var c = norm(cmd);
     if (parsed.status !== 'ok') return;
@@ -237,6 +282,7 @@ export class Elm327 {
       return;
     }
     cur.buffer += chunk;
+    if (typeof cur.onChunk === 'function') cur.onChunk(chunk);
     var idx = cur.buffer.indexOf('>');
     if (idx >= 0) {
       var raw = cur.buffer.slice(0, idx);
@@ -323,7 +369,7 @@ export class Elm327 {
 
     var ignitionHelp = 'The adapter is working but the car did not answer. Turn the ignition ON or press the start button until READY shows ' +
       '(on a hybrid, press start with your foot on the brake until the READY light comes on). ' +
-      'Also check the adapter is pushed fully into the port under the dashboard. Then tap Connect again.';
+      'Also check the adapter is pushed fully into the port under the dashboard.';
     if (first.status === 'unable' || first.status === 'nodata') {
       result.message = ignitionHelp;
     } else if (first.status === 'timeout') {

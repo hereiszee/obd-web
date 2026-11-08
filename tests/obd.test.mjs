@@ -107,7 +107,7 @@ export async function run() {
   });
 
   test('legacy with spaces and no protocol number', () => {
-    const r = parseLines(['48 6B 10 41 00 BE 3F A8 13 9C']);
+    const r = parseLines(['48 6B 10 41 00 BE 3F A8 13 BC']);
     assert.equal(r[0].ecu, '10');
     assert.equal(r[0].proto, 'legacy');
   });
@@ -150,6 +150,47 @@ export async function run() {
     const r = parseLines('SEARCHING...\r7E8064100BE3FA813\r\r>', 'A6');
     assert.equal(r.length, 1);
     assert.deepEqual(parseLines(['NO DATA'], '6'), []);
+  });
+
+  test('headers off, unknown protocol: 41 6B ... is a PID 6B reply, not a J1850 header', () => {
+    const r = parseLines(['416B5A5A00'], null);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].proto, 'raw');
+    assert.deepEqual(r[0].bytes, [0x41, 0x6b, 0x5a, 0x5a, 0x00]);
+  });
+
+  test('unknown protocol: J1850 frame with a valid CRC is still read as legacy', () => {
+    // 48 6B 10 41 0D 32 + J1850 CRC
+    const body = [0x48, 0x6b, 0x10, 0x41, 0x0d, 0x32];
+    let crc = 0xff;
+    body.forEach((b) => { crc ^= b; for (let k = 0; k < 8; k++) crc = (crc & 0x80) ? ((crc << 1) ^ 0x1d) & 0xff : (crc << 1) & 0xff; });
+    const line = body.concat([(~crc) & 0xff]).map((b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+    const r = parseLines([line], null);
+    assert.equal(r[0].proto, 'legacy');
+    assert.equal(r[0].ecu, '10');
+    assert.deepEqual(r[0].bytes, [0x41, 0x0d, 0x32]);
+  });
+
+  test('ISO-TP: first frame without its consecutive frame is marked incomplete', () => {
+    const r = parseLines(['7E8 10 08 43 03 01 71 04 20'], '6');
+    assert.equal(r.length, 1);
+    assert.equal(r[0].incomplete, true);
+    const d = parseDtcResponses(r, true);
+    assert.deepEqual(d[0].codes, ['P0171', 'P0420']);
+    assert.equal(d[0].partial, true);
+  });
+
+  test('ISO-TP: a skipped consecutive frame sequence number marks the message incomplete', () => {
+    const r = parseLines(['7E8 10 0E 43 06 01 71 04 20', '7E8 22 0A 80 03 00 00 00 00'], '6');
+    assert.equal(r.length, 1);
+    assert.equal(r[0].incomplete, true);
+    assert.deepEqual(r[0].bytes, [0x43, 0x06, 0x01, 0x71, 0x04, 0x20], 'data after the gap is not appended');
+  });
+
+  test('ISO-TP: consecutive frames in order are reassembled and complete', () => {
+    const r = parseLines(['7E8 10 0A 43 04 01 71 04 20', '7E8 21 0A 80 03 00 00 00 00'], '6');
+    assert.equal(r[0].incomplete, undefined);
+    assert.deepEqual(parseDtcResponses(r, true)[0].codes, ['P0171', 'P0420', 'P0A80', 'P0300']);
   });
 
   test('negative response 7F', () => {
@@ -237,6 +278,46 @@ export async function run() {
     const a = await obd.readDtcs('0A');
     assert.equal(a.supported, false);
     assert.equal(a.message, 'Not supported by this car');
+  });
+
+  test('Obd.readDtcs warns when part of a multi-frame answer was lost', async () => {
+    const obd = new Obd(new FakeElm(Object.assign({}, table, { '03': ['7E8 10 08 43 03 01 71 04 20'] })));
+    obd.protocolNumber = '6';
+    const s = await obd.readDtcs('03');
+    assert.equal(s.status, 'ok');
+    assert.equal(s.partial, true);
+    assert.ok(/some codes may be missing/i.test(s.message), s.message);
+    assert.deepEqual(s.byEcu[0].codes, ['P0171', 'P0420']);
+  });
+
+  test('Obd.freezeFrame asks for the freeze frame DTC with a frame number (020200)', async () => {
+    const elm = new FakeElm(Object.assign({}, table, {
+      '020200': ['7E8064202000171'],
+      '020000': ['7E8074200005C000000'],
+      '020C00': ['7E80542 0C 00 17 C0'.replace(/ /g, '')]
+    }));
+    const obd = new Obd(elm);
+    obd.protocolNumber = '6';
+    const ff = await obd.freezeFrame();
+    assert.ok(elm.sent.indexOf('020200') !== -1, 'sent: ' + elm.sent.join(','));
+    assert.ok(elm.sent.indexOf('0202') === -1, 'must not send a 2-byte mode 02 request');
+    assert.equal(ff.dtc, 'P0171');
+  });
+
+  test('used car flags: interrupted reads are not reported as "not supported"', () => {
+    const stopped = { status: 'stopped', supported: false, message: 'The request was stopped before the car answered.', byEcu: [] };
+    const flags = buildUsedCarFlags({
+      vin: { vin: null, status: 'timeout', message: 'x' },
+      readiness: parseReadiness([0x83, 0x07, 0x65, 0x25]),
+      vals: {}, items: [],
+      stored: { status: 'ok', supported: true, byEcu: [{ ecu: '7E8', codes: ['P0171'] }] },
+      pending: stopped,
+      permanent: stopped
+    }).map((f) => f.level + ': ' + f.text);
+    const all = flags.join('\n');
+    assert.ok(!/Permanent codes: not supported/.test(all), all);
+    assert.ok(!/VIN: not supported/.test(all), all);
+    assert.ok(/warn: Could not read the pending codes, permanent codes, VIN \(connection problem\)/.test(all), all);
   });
 
   test('Obd.readVin, clearDtcs, supportedPids', async () => {

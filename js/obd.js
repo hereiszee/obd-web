@@ -44,9 +44,38 @@ function isLegacyProtocol(p) {
   return n !== null && LEGACY_PROTOCOLS.indexOf(n) !== -1;
 }
 
-function looksLegacyHeader(bytes) {
-  // ISO 9141 / J1850: 48 6B 10, 68 6B 10, 41 6B 10. KWP2000: 8x F1 10.
-  return bytes.length >= 5 && (bytes[1] === 0x6b || bytes[1] === 0xf1);
+function isLegacyFormatByte(b) {
+  // ISO 9141 / J1850 VPW: 48 or 68. J1850 PWM: 41 or 61. KWP2000: 8x or Cx (length in low bits).
+  return b === 0x48 || b === 0x68 || b === 0x41 || b === 0x61 || (b & 0xc0) === 0x80 || (b & 0xc0) === 0xc0;
+}
+
+// J1850 CRC-8 (polynomial 0x1D, init 0xFF, inverted result).
+function j1850Crc(bytes) {
+  let crc = 0xff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc ^= bytes[i];
+    for (let k = 0; k < 8; k++) crc = (crc & 0x80) ? ((crc << 1) ^ 0x1d) & 0xff : (crc << 1) & 0xff;
+  }
+  return (~crc) & 0xff;
+}
+
+function legacyCheckOk(bytes) {
+  const body = bytes.slice(0, bytes.length - 1);
+  const last = bytes[bytes.length - 1];
+  let sum = 0;
+  for (let i = 0; i < body.length; i++) sum = (sum + body[i]) & 0xff;
+  return sum === last || j1850Crc(body) === last;
+}
+
+// strict: protocol unknown. A headers-off reply such as 41 6B 5A 5A 00 (mode 01 PID 6B) has the
+// same shape as a J1850 PWM header (41 6B 10), so then the check byte must also be valid.
+function looksLegacyHeader(bytes, strict) {
+  if (bytes.length < 5) return false;
+  if (bytes[1] !== 0x6b && bytes[1] !== 0xf1) return false;
+  if (!isLegacyFormatByte(bytes[0])) return false;
+  if (bytes[3] < 0x40 || bytes[3] > 0x7f) return false; // must be a response service ID (or 7F)
+  if (strict && !legacyCheckOk(bytes)) return false;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,11 +135,17 @@ export function parseLines(lines, protocolNumber) {
       if (frame.length < 2) return;
       if (canState[ecu]) finishCan(ecu, protoTag, true);
       const len = ((pci & 0x0f) << 8) | frame[1];
-      canState[ecu] = { len, data: frame.slice(2), proto: protoTag };
+      canState[ecu] = { len, data: frame.slice(2), proto: protoTag, seq: 1 };
       if (canState[ecu].data.length >= len) finishCan(ecu, protoTag, false);
     } else if (type === 2) {
       const st = canState[ecu];
       if (!st) return; // consecutive frame without a first frame, ignore
+      if ((pci & 0x0f) !== st.seq) {
+        // A consecutive frame was lost. The rest cannot be lined up, so close the message as incomplete.
+        finishCan(ecu, protoTag, true);
+        return;
+      }
+      st.seq = (st.seq + 1) & 0x0f;
       for (let i = 1; i < frame.length; i++) st.data.push(frame[i]);
       if (st.data.length >= st.len) finishCan(ecu, protoTag, false);
     }
@@ -164,7 +199,7 @@ export function parseLines(lines, protocolNumber) {
     if (odd) continue; // nothing sensible left
 
     const bytes = hexToBytes(l);
-    if (!knownCan && looksLegacyHeader(bytes)) {
+    if (!knownCan && looksLegacyHeader(bytes, !knownLegacy)) {
       // priority/format, target, source, data..., checksum
       out.push({ ecu: hex2(bytes[2]), bytes: bytes.slice(3, bytes.length - 1), proto: 'legacy' });
       continue;
@@ -250,6 +285,7 @@ export function decodeDtc(byteA, byteB) {
 export function parseDtcResponses(responses, isCan) {
   const byEcu = {};
   const order = [];
+  const partial = {};
   for (let i = 0; i < responses.length; i++) {
     const r = responses[i];
     const b = r.bytes;
@@ -266,6 +302,7 @@ export function parseDtcResponses(responses, isCan) {
     let start = 1;
     let max = Infinity;
     if (can) { start = 2; max = b[1]; }
+    if (r.incomplete || (can && b[1] > Math.floor((b.length - 2) / 2))) partial[r.ecu] = true;
     let n = 0;
     for (let j = start; j + 1 < b.length && n < max; j += 2) {
       if (b[j] === 0 && b[j + 1] === 0) continue;
@@ -274,7 +311,11 @@ export function parseDtcResponses(responses, isCan) {
       if (codes.indexOf(code) === -1) codes.push(code);
     }
   }
-  return sortByEcu(order.map((ecu) => ({ ecu, label: ecuLabel(ecu), codes: byEcu[ecu] })));
+  return sortByEcu(order.map((ecu) => {
+    const e = { ecu, label: ecuLabel(ecu), codes: byEcu[ecu] };
+    if (partial[ecu]) e.partial = true;
+    return e;
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +521,7 @@ function safeDescribe(code) {
 }
 
 const NOT_SUPPORTED = 'Not supported by this car';
+const PARTIAL_CODES = 'Part of the answer from the car was lost, so some codes may be missing. Read the codes again.';
 
 // ---------------------------------------------------------------------------
 // Obd class
@@ -533,7 +575,11 @@ export class Obd {
       if (m.bytes[0] === mode + 0x40) responses.push(m);
       else if (m.bytes[0] === 0x7f && m.bytes[1] === mode) negative.push({ ecu: m.ecu, nrc: m.bytes[2] });
     });
-    if (responses.length) return { status: 'ok', message: '', responses, negative, raw: r.raw };
+    if (responses.length) {
+      const res = { status: 'ok', message: '', responses, negative, raw: r.raw };
+      if (responses.some((m) => m.incomplete)) res.incomplete = true;
+      return res;
+    }
     if (negative.length) {
       return { status: 'unsupported', message: NOT_SUPPORTED + '.', responses, negative, raw: r.raw };
     }
@@ -581,6 +627,9 @@ export class Obd {
       const byEcu = parseDtcResponses(q.responses, can === null ? undefined : can);
       byEcu.forEach((e) => { e.details = e.codes.map(safeDescribe); });
       const total = byEcu.reduce((n, e) => n + e.codes.length, 0);
+      if (q.incomplete || byEcu.some((e) => e.partial)) {
+        return { status: 'ok', supported: true, partial: true, message: PARTIAL_CODES, byEcu };
+      }
       return { status: 'ok', supported: true, message: total ? '' : 'No codes reported.', byEcu };
     }
     if (q.status === 'unsupported' || (m === '0A' && q.status === 'nodata')) {
@@ -714,7 +763,8 @@ export class Obd {
   }
 
   async freezeFrame() {
-    const q = await this.query('0202');
+    // Mode 02 PID 02 (the code that stored the freeze frame), frame 0: 02 02 00.
+    const q = await this.query('020200');
     let dtc = null;
     if (q.status === 'ok') {
       const m = sortByEcu(q.responses.filter((x) => x.bytes[1] === 0x02 && x.bytes.length >= 5))[0];
@@ -828,8 +878,15 @@ export class Obd {
     const permanent = await this.readDtcs('0A');
 
     const flags = buildUsedCarFlags({ vin, readiness, vals, items, stored, pending, permanent });
-    return { vin, readiness, items, dtcs: { stored, pending, permanent }, flags };
+    const interrupted = [vin, readiness, stored, pending, permanent].some((r) => r && readFailed(r.status)) ||
+      items.some((it) => it.supported === null);
+    return { vin, readiness, items, dtcs: { stored, pending, permanent }, flags, interrupted };
   }
+}
+
+// A status that means "we could not ask" (connection trouble), as opposed to "the car said no".
+function readFailed(status) {
+  return !!status && status !== 'ok' && status !== 'nodata' && status !== 'unsupported';
 }
 
 function countCodes(r) {
@@ -860,7 +917,19 @@ export function buildUsedCarFlags(d) {
   if (nStored) flags.push({ level: 'warn', text: nStored + ' stored trouble code' + (nStored > 1 ? 's' : '') + ' (' + listCodes(d.stored) + '). These are confirmed faults.' });
   if (nPending) flags.push({ level: 'warn', text: nPending + ' pending code' + (nPending > 1 ? 's' : '') + ' (' + listCodes(d.pending) + '). The car has seen a possible fault that is not yet confirmed.' });
   if (nPerm) flags.push({ level: 'warn', text: nPerm + ' permanent code' + (nPerm > 1 ? 's' : '') + ' (' + listCodes(d.permanent) + '). These cannot be erased with a scan tool. They go away only after the car confirms the repair by itself.' });
-  if (d.permanent && d.permanent.supported === false) flags.push({ level: 'info', text: 'Permanent codes: not supported by this car.' });
+  const couldNotRead = [];
+  if (d.stored && readFailed(d.stored.status)) couldNotRead.push('stored codes');
+  if (d.pending && readFailed(d.pending.status)) couldNotRead.push('pending codes');
+  if (d.permanent && readFailed(d.permanent.status)) couldNotRead.push('permanent codes');
+  else if (d.permanent && d.permanent.supported === false) flags.push({ level: 'info', text: 'Permanent codes: not supported by this car.' });
+  if (d.stored && d.stored.partial || d.pending && d.pending.partial || d.permanent && d.permanent.partial) {
+    flags.push({ level: 'warn', text: 'Part of the trouble code answer was lost, so some codes may be missing. Run the check again.' });
+  }
+  if (rd.status && readFailed(rd.status)) couldNotRead.push('readiness monitors');
+  if (d.vin && !d.vin.vin && readFailed(d.vin.status)) couldNotRead.push('VIN');
+  if (couldNotRead.length) {
+    flags.push({ level: 'warn', text: 'Could not read the ' + couldNotRead.join(', ') + ' (connection problem). Run the check again.' });
+  }
   const allRead = d.stored && d.stored.status === 'ok' && d.pending && d.pending.status === 'ok';
   if (allRead && !nStored && !nPending && !nPerm) flags.push({ level: 'ok', text: 'No stored or pending trouble codes.' });
 
@@ -892,7 +961,7 @@ export function buildUsedCarFlags(d) {
   }
 
   if (d.vin && d.vin.vin) flags.push({ level: 'info', text: 'VIN reported by the car: ' + d.vin.vin + '. Check it matches the plate on the car and the paperwork.' });
-  else if (d.vin) flags.push({ level: 'info', text: 'VIN: not supported by this car (common on older cars).' });
+  else if (d.vin && !readFailed(d.vin.status)) flags.push({ level: 'info', text: 'VIN: not supported by this car (common on older cars).' });
 
   const unsupported = (d.items || []).filter((it) => it.supported === false).map((it) => it.label);
   if (unsupported.length) flags.push({ level: 'info', text: 'Not supported by this car: ' + unsupported.join(', ') + '. This is normal and not a fault.' });

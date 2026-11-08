@@ -13,6 +13,7 @@ import { buildReport } from './report.js';
 var APP_VERSION = '1.0.0';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
+var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
 
 // ---------------------------------------------------------------- state
 
@@ -28,8 +29,8 @@ var S = {
   userDisconnecting: false,
   init: null,
   supported: null,
-  live: { running: false, promise: null, selected: [], values: {}, tiles: {}, openPid: null },
-  results: { check: null, codes: null, readiness: null, freeze: null }
+  live: { running: false, promise: null, gen: 0, error: null, selected: [], values: {}, tiles: {}, openPid: null },
+  results: { check: null, vin: null, codes: null, readiness: null, freeze: null }
 };
 
 // ---------------------------------------------------------------- helpers
@@ -95,6 +96,11 @@ function pidDef(pid) { return PIDS[pid] || null; }
 function pidName(pid) {
   var d = pidDef(pid);
   return d ? d.name : 'Reading ' + hex2(pid);
+}
+
+// Short numeric values stay on one line, longer text values wrap so the table fits a phone screen.
+function valClass(val) {
+  return /^-?[\d.,]+(\s?\S{1,6})?$/.test(String(val)) ? 'val num' : 'val';
 }
 
 function vinText(v) {
@@ -220,7 +226,7 @@ function setDisabled(id, off) { $(id).disabled = !!off; }
 function updateButtons() {
   var hasT = !!S.transport;
   var live = S.live.running;
-  var ready = S.connected && !S.busy && !live;
+  var ready = S.connected && !S.busy && !live && !S.live.promise;
 
   setDisabled('btnConnect', hasT || S.busy);
   setDisabled('btnSim', hasT || S.busy);
@@ -232,13 +238,16 @@ function updateButtons() {
 
   ['btnCheck', 'btnRead', 'btnClear', 'btnReadiness', 'btnFreeze'].forEach(function (id) { setDisabled(id, !ready); });
 
+  // The old loop may still be finishing its last request after Stop. Keep Start disabled until it has.
+  var stopping = !live && !!S.live.promise;
   var lb = $('btnLive');
-  lb.textContent = live ? 'Stop live data' : 'Start live data';
+  lb.textContent = live ? 'Stop live data' : (stopping ? 'Stopping...' : 'Start live data');
   lb.className = live ? 'btn btn-danger' : 'btn btn-primary';
-  setDisabled('btnLive', live ? false : (!S.connected || S.busy || S.live.selected.length === 0));
+  setDisabled('btnLive', live ? false : (stopping || !S.connected || S.busy || S.live.selected.length === 0));
 
   // Explain why the main tools are greyed out, once, in the live card.
   if (live) setMsg($('liveMsg'), 'info', null, TEXT.live.stopFirst);
+  else if (S.live.error) setMsg($('liveMsg'), 'bad', 'Live data stopped', S.live.error);
   else if (!S.connected) setMsg($('liveMsg'), 'info', null, 'Connect to the car (or the simulated car) to see live readings.');
   else if (S.live.selected.length === 0) setMsg($('liveMsg'), 'info', null, 'No readings selected. Open "Choose readings" and tick a few.');
   else setMsg($('liveMsg'), null, null, null);
@@ -346,9 +355,14 @@ function attach(t, kind, scenario) {
 }
 
 function talkToCar() {
+  var elm = S.elm;
+  var t = S.transport;
+  // True when the adapter was disconnected (or replaced) while we were waiting on it.
+  function stale() { return S.transport !== t || S.elm !== elm || !t; }
   setStatus('busy', 'Adapter connected. Waking up the adapter and asking the car to answer. The first time can take up to 15 seconds.', 'Talking to car...');
   setMsg($('connectMsg'), null);
-  return S.elm.init().then(function (r) {
+  return elm.init().then(function (r) {
+    if (stale()) { logger.log('info', 'Adapter setup finished after the connection was closed. Result ignored.'); return; }
     S.init = r || {};
     if (S.obd) {
       S.obd.protocolNumber = (r && r.protocolNumber) || null;
@@ -373,6 +387,7 @@ function talkToCar() {
         return null;
       })
       .then(function (sup) {
+        if (stale()) return;
         S.supported = sup && sup.all ? sup : { all: new Set(), byEcu: {} };
         var sim = S.kind === 'sim' ? ' (simulated car)' : '';
         setStatus('ok', 'Connected to the car' + sim + '. Everything below is ready to use.', S.kind === 'sim' ? 'Simulated car' : 'Connected');
@@ -393,9 +408,11 @@ function renderConnectInfo() {
   var r = S.init || {};
   var info = (S.transport && S.transport.info) || {};
   var rows = [];
-  rows.push(['Source', S.kind === 'sim' ? 'Simulated car (' + (S.scenario || 'normal') + ')' : (info.deviceName || 'Bluetooth adapter')]);
+  rows.push(['Source', S.kind === 'sim' ? 'Simulated car (' + (SCENARIO_LABELS[S.scenario] || SCENARIO_LABELS.normal) + ')' : (info.deviceName || 'Bluetooth adapter')]);
   if (r.elmVersion) rows.push(['Adapter chip', r.elmVersion]);
-  if (r.protocol) rows.push(['Car protocol', r.protocol]);
+  // 'AUTO' alone means no protocol was found yet, which tells the user nothing.
+  var proto = r.protocol ? String(r.protocol).replace(/^AUTO,\s*/i, '').trim() : '';
+  if (proto && !/^AUTO$/i.test(proto)) rows.push(['Car protocol', proto]);
   if (r.voltage) rows.push(['Battery voltage', voltText(r.voltage) + ' (about 12.4V or more with engine off is healthy, 13.5V to 14.7V while running or READY)']);
   rows.forEach(function (row) {
     box.appendChild(h('div', { class: 'k', text: row[0] }));
@@ -519,6 +536,7 @@ function onCheck() {
   run('Used car check', function () {
     return S.obd.usedCarCheck(onProgress).then(function (res) {
       S.results.check = res || null;
+      S.results.vin = (res && res.vin) || null;
       if (res && res.readiness && res.readiness.monitors) S.results.readiness = res.readiness;
       renderCheck(res || {});
     });
@@ -529,6 +547,10 @@ function renderCheck(res) {
   var out = $('checkOut');
   clear(out);
   var flags = Array.isArray(res.flags) ? res.flags : [];
+  if (res.interrupted) {
+    out.appendChild(notice('warn', 'The check did not finish',
+      'Some parts could not be read because of a connection problem, so the findings below are incomplete. Check the adapter is connected, then run the check again.'));
+  }
   out.appendChild(h('h3', { text: 'Findings' }));
   out.appendChild(h('div', { class: 'legend' }, [
     h('span', null, [h('span', { class: 'dot dot-warn' }), 'Needs attention']),
@@ -539,7 +561,8 @@ function renderCheck(res) {
     out.appendChild(h('p', { class: 'muted', text: 'No findings were produced. Check the debug console for details.' }));
   } else {
     var order = { warn: 0, info: 1, ok: 2 };
-    var sorted = flags.slice().sort(function (a, b) { return (order[a.level] || 1) - (order[b.level] || 1); });
+    var rank = function (f) { return f.level in order ? order[f.level] : 1; };
+    var sorted = flags.slice().sort(function (a, b) { return rank(a) - rank(b); });
     var ul = h('ul', { class: 'flags' });
     sorted.forEach(function (f) {
       var lvl = f.level === 'warn' || f.level === 'ok' ? f.level : 'info';
@@ -573,7 +596,7 @@ function renderCheck(res) {
       var val = it.text != null ? it.text : (it.value != null ? it.value + (it.unit ? ' ' + it.unit : '') : (it.supported === false ? 'Not supported by this car' : '--'));
       table.appendChild(h('tr', null, [
         h('td', null, [String(it.label || it.name || ''), it.explain ? h('div', { class: 'small muted', text: it.explain }) : null]),
-        h('td', { class: 'val', text: String(val) })
+        h('td', { class: valClass(val), text: String(val) })
       ]));
     });
     out.appendChild(table);
@@ -724,6 +747,12 @@ function onClearConfirmed() {
       logger.log('info', 'Codes cleared by user.');
       S.results.freeze = null;
       S.results.readiness = null;
+      // The used car check and readiness shown earlier describe the car before the clear.
+      S.results.check = null;
+      clear($('checkOut'));
+      clear($('readinessOut'));
+      clear($('freezeOut'));
+      $('checkOut').appendChild(h('p', { class: 'muted small', text: 'Codes were cleared, so the earlier check results no longer apply. Run the check again to see the current state.' }));
       out.appendChild(notice('ok', 'Codes cleared', TEXT.clear.success));
       var codes = { stored: null, pending: null, permanent: null, at: new Date() };
       return delay(400).then(function () { return readCodesInto(codes); }).then(function () {
@@ -745,7 +774,9 @@ function renderReadinessBody(r) {
   var mons = Array.isArray(r.monitors) ? r.monitors : [];
   var used = mons.filter(function (m) { return m.available; });
   var ready = used.filter(function (m) { return m.complete; });
-  var notReady = used.length - ready.length;
+  // Same rule as the used car check findings: count the non-continuous monitors that are not finished.
+  var notReady = used.filter(function (m) { return !m.complete && !m.continuous; }).length;
+  var contNotReady = used.filter(function (m) { return !m.complete && m.continuous; }).length;
 
   if (typeof r.milOn === 'boolean') {
     wrap.appendChild(r.milOn
@@ -754,8 +785,10 @@ function renderReadinessBody(r) {
   }
   if (used.length) {
     var summary = ready.length + ' of ' + used.length + ' monitors ready.';
-    var advice = notReady === 0 ? ' All self-tests have completed. That is a good sign.'
-      : (notReady <= 2 ? ' A couple not ready is common after short trips.' : ' Several not ready usually means codes were cleared or the battery was disconnected recently.');
+    var advice;
+    if (notReady === 0) advice = contNotReady ? ' The main self-tests have completed.' : ' All self-tests have completed. That is a good sign.';
+    else if (notReady === 1) advice = ' One not ready is fairly common after short trips, especially the fuel vapour (EVAP) test.';
+    else advice = ' Two or more not ready often means the codes were cleared or the battery was disconnected recently. Drive normally for a few days and check again.';
     wrap.appendChild(h('p', null, [h('strong', { text: summary }), advice]));
   }
   if (r.ignition) {
@@ -823,7 +856,7 @@ function onFreeze() {
         var val = v.text != null ? v.text : (v.value != null ? v.value + (v.unit ? ' ' + v.unit : '') : '--');
         table.appendChild(h('tr', null, [
           h('td', { text: v.name || pidName(pid) }),
-          h('td', { class: 'val', text: String(val) })
+          h('td', { class: valClass(val), text: String(val) })
         ]));
       });
       out.appendChild(table);
@@ -853,6 +886,7 @@ function setupLive() {
   if (!sel.length) sel = avail.slice(0, 6);
   S.live.selected = sel;
   S.live.values = {};
+  S.live.error = null;
   renderPicker(avail);
   renderTiles();
   updateButtons();
@@ -974,12 +1008,14 @@ function normalizeReadings(res) {
   return (arr || []).filter(function (x) { return x && typeof x === 'object' && x.pid != null; });
 }
 
-function liveLoop() {
+function liveLoop(gen) {
   var count = 0;
   var t0 = Date.now();
   var lastRate = t0;
+  // Only the loop with the current generation may keep running.
+  function mine() { return S.live.running && S.live.gen === gen && !!S.obd; }
   function cycle() {
-    if (!S.live.running || !S.obd) return Promise.resolve();
+    if (!mine()) return Promise.resolve();
     var sel = S.live.selected.slice();
     if (!sel.length) return delay(300).then(cycle);
     var chunks = [];
@@ -987,7 +1023,7 @@ function liveLoop() {
     var p = Promise.resolve();
     chunks.forEach(function (chunk) {
       p = p.then(function () {
-        if (!S.live.running || !S.obd) return;
+        if (!mine()) return;
         return S.obd.readPids(chunk).then(function (res) {
           var got = normalizeReadings(res);
           var seen = {};
@@ -1009,7 +1045,7 @@ function liveLoop() {
     return p.then(function () {
       count++;
       var now = Date.now();
-      if (now - lastRate > 1500) {
+      if (mine() && now - lastRate > 1500) {
         var rate = count / ((now - t0) / 1000);
         $('liveRate').textContent = 'About ' + (Math.round(rate * 10) / 10) + ' updates per second';
         lastRate = now;
@@ -1023,21 +1059,28 @@ function liveLoop() {
 
 function onLiveToggle() {
   if (S.live.running) { stopLive(); return; }
+  // A previous loop is still finishing its last request: wait for it (the button is disabled meanwhile).
+  if (S.live.promise) return;
   if (!S.connected || S.busy || !S.live.selected.length) return;
+  var gen = ++S.live.gen;
   S.live.running = true;
+  S.live.error = null;
   logger.log('info', '== Live data started');
   $('liveRate').textContent = 'Starting...';
   updateButtons();
-  S.live.promise = liveLoop().catch(function (e) {
+  var p = liveLoop(gen).catch(function (e) {
     logger.log('error', 'Live loop stopped: ' + ((e && e.stack) || e));
-    setMsg($('liveMsg'), 'bad', 'Live data stopped', friendlyError(e));
+    if (S.live.gen === gen) S.live.error = friendlyError(e);
   }).then(function () {
-    S.live.running = false;
-    S.live.promise = null;
-    $('liveRate').textContent = '';
+    if (S.live.promise === p) {
+      S.live.running = false;
+      S.live.promise = null;
+      $('liveRate').textContent = '';
+    }
     logger.log('info', '== Live data stopped');
     updateButtons();
   });
+  S.live.promise = p;
 }
 
 function stopLive() {
@@ -1080,7 +1123,7 @@ function onBuildReport() {
         protocolNumber: init.protocolNumber || null,
         voltage: init.voltage ? voltText(init.voltage) : null
       } : null,
-      vin: S.results.check ? S.results.check.vin : null,
+      vin: S.results.vin || (S.results.check ? S.results.check.vin : null),
       check: S.results.check,
       codes: S.results.codes,
       readiness: S.results.readiness,

@@ -105,7 +105,7 @@ export const TEXT = {
     ready: 'Ready',
     notReady: 'Not ready yet',
     notUsed: 'Not used on this car',
-    help: 'A few "not ready" monitors are normal on a car that has only done short trips. Many "not ready" monitors usually means the codes were cleared recently or the battery was disconnected. Most inspections allow one or two not ready.'
+    help: 'A few "not ready" monitors are normal on a car that has only done short trips. Many "not ready" monitors usually means the codes were cleared recently or the battery was disconnected. Inspections usually allow at most one not ready (some allow two on older cars).'
   },
 
   freeze: {

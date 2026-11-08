@@ -319,7 +319,8 @@ export class SimTransport {
     this._inBuf = '';
   }
 
-  // Steps: {delay: ms} or {text: string}. Text is split into random 1-20 char
+  // Steps: {delay: ms}, {text: string} or {fn: function} (state change that only happens
+  // if the reply is not interrupted first). Text is split into random 1-20 char
   // fragments with 5-60 ms gaps, the way BLE notifications arrive.
   _emit(steps) {
     const gen = this._gen;
@@ -327,6 +328,7 @@ export class SimTransport {
     const queue = [];
     steps.forEach((s) => {
       if (s.delay) queue.push({ delay: s.delay });
+      if (s.fn) queue.push({ fn: s.fn });
       if (s.text) {
         let i = 0;
         while (i < s.text.length) {
@@ -346,6 +348,7 @@ export class SimTransport {
           this._timers.push(t);
           return;
         }
+        if (item.fn) { item.fn(); continue; }
         if (typeof this.onData === 'function') this.onData(item.chunk);
         if (gen !== this._gen) return;
       }
@@ -456,6 +459,10 @@ export class SimTransport {
     const eol = this._eol();
     const carProto = this._carProtocol();
     const asleep = this.scenario === 'ignitionOff';
+    // Protocol the reply is formatted for. While searching, this.found is only set once the
+    // search delay has run, so an interrupted search (STOPPED) leaves the adapter unlocked.
+    let fmtProto = this.found;
+    const lock = (p) => { fmtProto = p; steps.push({ fn: () => { this.found = p; } }); };
 
     if (!this.found) {
       const first = this.protocol || carProto;
@@ -468,18 +475,18 @@ export class SimTransport {
           return steps.concat(this._reply(['UNABLE TO CONNECT'], d));
         }
         steps.push({ delay: carProto === 3 ? 2600 : 800 + this._rand() * 150 });
-        this.found = carProto;
+        lock(carProto);
       } else if (!this.protoAuto || tryWorks) {
         const p = this.protocol;
         if (p >= 3 && p <= 5) {
           steps.push({ delay: 20 }, { text: 'BUS INIT: ' }, { delay: 700 }, { text: '...' }, { delay: 1500 });
           if (p !== carProto || asleep) return steps.concat([{ text: 'ERROR' + eol + eol + '>' }]);
           steps.push({ text: 'OK' + eol });
-          this.found = p;
+          lock(p);
         } else if (p === 1 || p === 2) {
           return this._reply(['NO DATA'], 300);
         } else if (p === 6 && carProto === 6 && !asleep) {
-          this.found = 6;
+          lock(6);
         } else if (p === 7 && carProto === 6 && !asleep) {
           return this._reply(['NO DATA'], 250);
         } else {
@@ -492,7 +499,7 @@ export class SimTransport {
     let msgs = this._answer(bytes);
     if (msgs === null || msgs.length === 0) return steps.concat(this._reply(['NO DATA'], 180 + this._rand() * 80));
     if (maxResp > 0) msgs = msgs.slice(0, maxResp);
-    const lines = this.found === 3 ? this._formatLegacy(msgs) : this._formatCan(msgs);
+    const lines = fmtProto === 3 ? this._formatLegacy(msgs) : this._formatCan(msgs);
     const delay = 35 + this._rand() * 60 + (msgs.length > 1 ? 30 : 0);
     return steps.concat(this._reply(lines, delay));
   }
@@ -534,13 +541,19 @@ export class SimTransport {
     }
 
     if (mode === 0x02) {
-      if (req.length < 2) { neg(0x13); return out; }
+      // Mode 02 requests are PID + frame number pairs (02 0C 00). A PID without its frame
+      // number is a malformed request: CAN ECUs answer 7F 02 13, older protocols stay silent.
+      if (req.length < 2 || (req.length - 1) % 2 !== 0) {
+        if (legacy) return null;
+        neg(0x13);
+        return out;
+      }
       const e = ecus[0] === '7E8' || ecus[0] === '10' ? ecus[0] : null;
       if (!e) return null;
       const data = [0x42];
       for (let i = 1; i < req.length; i += 2) {
         const pid = req[i];
-        const frame = i + 1 < req.length ? req[i + 1] : 0;
+        const frame = req[i + 1];
         if (frame !== 0) continue;
         const v = this._freezeBytes(pid);
         if (v) data.push(pid, frame, ...v);

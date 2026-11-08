@@ -125,6 +125,10 @@ export class BleTransport {
       });
     } catch (e) {
       this._logger.log('warn', 'Device picker closed or failed: ' + errText(e));
+      // Chrome and Bluefy also use NotFoundError when the Bluetooth radio is off or missing.
+      if (e && /adapter not available|bluetooth.*(off|unavailable|not available|disabled)|radio/i.test(String(e.message || ''))) {
+        throw new Error('Bluetooth is turned off. Turn it on, then tap Connect again.');
+      }
       if (e && e.name === 'NotFoundError') {
         throw new Error('No adapter was chosen. Tap Connect again and pick your adapter from the list.');
       }
@@ -227,9 +231,9 @@ export class BleTransport {
     this.info.notifyUuid = pick.notify.uuid;
     this.info.writeUuid = pick.write.uuid;
     var wp = pick.write.props;
+    this._writeProps = wp;
     if (wp.writeWithoutResponse && typeof this._writeChar.writeValueWithoutResponse === 'function') this._writeMode = 'withoutResponse';
     else if (typeof this._writeChar.writeValueWithResponse === 'function' && wp.write) this._writeMode = 'withResponse';
-    else if (typeof this._writeChar.writeValueWithoutResponse === 'function' && wp.writeWithoutResponse) this._writeMode = 'withoutResponse';
     else this._writeMode = 'legacy';
     this._logger.log('info', 'Using notify ' + pick.notify.uuid + ' and write ' + pick.write.uuid +
       ' in service ' + pick.write.service + ' (' + pick.reason + ', write mode ' + this._writeMode + ')');
@@ -378,9 +382,33 @@ export class BleTransport {
       var chunk = bytes.slice(off, Math.min(off + CHUNK, bytes.length));
       var ch = this._writeChar;
       if (!ch) throw new Error('Not connected to the adapter.');
-      if (this._writeMode === 'withoutResponse') await ch.writeValueWithoutResponse(chunk);
-      else if (this._writeMode === 'withResponse') await ch.writeValueWithResponse(chunk);
-      else await ch.writeValue(chunk);
+      try {
+        await this._writeChunk(ch, chunk);
+      } catch (e) {
+        // Some WebViews reject write-without-response even though the characteristic advertises it.
+        // If plain writes are possible, switch to them for good and retry this chunk once.
+        var fallback = this._fallbackMode();
+        if (!fallback || !this.isConnected()) throw e;
+        this._logger.log('warn', 'Write without response failed (' + errText(e) + '). Switching to write mode ' + fallback + '.');
+        this._writeMode = fallback;
+        await this._writeChunk(ch, chunk);
+      }
     }
+  }
+
+  _writeChunk(ch, chunk) {
+    if (this._writeMode === 'withoutResponse') return ch.writeValueWithoutResponse(chunk);
+    if (this._writeMode === 'withResponse') return ch.writeValueWithResponse(chunk);
+    return ch.writeValue(chunk);
+  }
+
+  _fallbackMode() {
+    if (this._writeMode !== 'withoutResponse') return null;
+    var ch = this._writeChar;
+    var wp = this._writeProps || {};
+    if (!ch) return null;
+    if (wp.write && typeof ch.writeValueWithResponse === 'function') return 'withResponse';
+    if (typeof ch.writeValue === 'function') return 'legacy';
+    return null;
   }
 }

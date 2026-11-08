@@ -139,7 +139,7 @@ export class Obd {
                                      //   - many monitors incomplete → same suspicion
                                      //   - MIL on, stored/pending codes present
                                      //   - unsupported items listed as "not supported by this car" not errors
-  async freezeFrame()                // 0202 (DTC that caused freeze frame), then for supported PIDs via 0200 bitmap, read 02 XX 00 for
+  async freezeFrame()                // 020200 (DTC that caused freeze frame, frame 0), then for supported PIDs via 0200 bitmap, read 02 XX 00 for
                                      // common PIDs (04,05,06,07,0B,0C,0D,0E,0F,11,42...). returns {dtc, values:[{pid,name,value,unit}] , status, message}
   async readPid(pid)                 // single PID live read → {pid, ecu, value, unit, text} using pids.js decoder (first ECU that answers, prefer 7E8)
   async readPids(pidList)            // CAN allows up to 6 PIDs per request (e.g. '010C0D0511'); use multi-PID on CAN, single on legacy. Fallback
@@ -194,7 +194,7 @@ Same interface as BleTransport. Pretends to be an ELM327 v1.5 on a 2020 Toyota C
 - 0101 MIL on, readiness with a couple incomplete. 0131 = 85 km, 014E = 42 min, 0130 = 3 warm-ups (so "recently cleared" flag fires).
   0121 = 0. 0141 realistic.
 - Live PIDs vary smoothly over time (RPM 0 when engine off in EV mode, sometimes 1100-2400, speed 0-60, coolant warming 40→90 C, etc).
-- 0202/02xx00 freeze frame values for P0171.
+- 020200/02xx00 freeze frame values for P0171 (mode 02 requests are PID + frame pairs, a missing frame byte gets 7F 02 13 on CAN).
 - Unknown commands → '?'. Unsupported PIDs → 'NO DATA'. Occasional (5%) 'NO DATA' on a live PID to exercise handling (not on init cmds).
 - A 'scenario' option: new SimTransport({scenario:'normal'|'ignitionOff'|'legacy'}) where ignitionOff makes 0100 return
   'SEARCHING...\rUNABLE TO CONNECT' and legacy uses ISO 9141-2 (protocol 3) with headers format '486B10...' and no mode 0A.

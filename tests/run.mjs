@@ -292,6 +292,43 @@ async function runE2E() {
     });
   }
 
+  console.log('\n== end to end: timeout recovery and strict mode 02');
+  {
+    const { elm, obd } = await makeStack('normal', { timeScale: 0.5 });
+    await test('timeout: adapter is resynchronised so the next command is not lost', async () => {
+      assert.equal((await elm.send('ATE0')).status, 'ok');
+      assert.equal((await elm.send('ATH1')).status, 'ok');
+      // The simulated search takes about 400 ms here, so this times out mid-search.
+      const r1 = await elm.send('0100', { timeout: 100 });
+      assert.equal(r1.status, 'timeout');
+      const r2 = await elm.send('010D');
+      assert.equal(r2.status, 'ok', 'next command after a timeout: ' + r2.status + ' ' + JSON.stringify(r2.raw));
+      assert.ok(r2.lines.some((l) => /^7E8/.test(l)), 'real data: ' + r2.lines.join('|'));
+      // The interrupted search did not lock a protocol, so the adapter searched again.
+      assert.ok(/SEARCHING/.test(r2.raw), 'searched again: ' + JSON.stringify(r2.raw));
+      const r3 = await elm.send('010C');
+      assert.equal(r3.status, 'ok');
+      assert.ok(!/SEARCHING/.test(r3.raw), 'protocol locked after a completed search');
+    });
+    await test('sim: mode 02 request without a frame number is rejected (7F 02 13)', async () => {
+      obd.protocolNumber = '6';
+      const bad = await obd.query('0202');
+      assert.equal(bad.status, 'unsupported');
+      assert.equal(bad.negative[0].nrc, 0x13);
+      const good = await obd.query('020200');
+      assert.equal(good.status, 'ok');
+      assert.deepEqual(good.responses[0].bytes.slice(0, 3), [0x42, 0x02, 0x00]);
+    });
+    await test('init after a dropped link reports a lost connection', async () => {
+      const S2 = await makeStack('normal', { timeScale: 1 });
+      S2.t.onDisconnect = () => S2.elm.cancelAll(); // as the app does
+      setTimeout(() => S2.t.simulateDrop(), 150);
+      const r = await S2.elm.init();
+      assert.equal(r.ok, false);
+      assert.ok(/Lost connection/i.test(r.message), r.message);
+    });
+  }
+
   console.log('\n== end to end: legacy scenario (ISO 9141-2)');
   {
     const { elm, obd, logger } = await makeStack('legacy');
@@ -354,6 +391,7 @@ async function runE2E() {
       assert.ok(/ignition ON/i.test(init.message), init.message);
       assert.ok(/READY/.test(init.message), init.message);
       assert.ok(!/settings/i.test(init.message), 'must not mention Settings');
+      assert.ok(!/tap Connect again/i.test(init.message), 'the app offers "Ask the car again" instead: ' + init.message);
       assert.equal(init.elmVersion, 'v1.5', 'adapter itself still answers');
     });
     await test('ignitionOff: OBD reads fail gracefully', async () => {

@@ -1,0 +1,901 @@
+// OBD-II protocol parsing and high-level reads.
+// Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
+// Plain ES2020, no dependencies beyond the sibling modules.
+
+import { decodePid, PIDS, MONITORS } from './pids.js';
+import { describeDtc } from './dtc-db.js';
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function hex2(n) {
+  const s = (n & 0xff).toString(16).toUpperCase();
+  return s.length < 2 ? '0' + s : s;
+}
+
+function hexToBytes(hex) {
+  const out = [];
+  for (let i = 0; i + 1 < hex.length; i += 2) out.push(parseInt(hex.substr(i, 2), 16));
+  return out;
+}
+
+const HEX_RE = /^[0-9A-F]+$/;
+const CAN_PROTOCOLS = ['6', '7', '8', '9', 'A', 'B', 'C'];
+const LEGACY_PROTOCOLS = ['1', '2', '3', '4', '5'];
+
+// ATDPN may return 'A6' (automatic, protocol 6). Strip the 'A' prefix only when two chars long.
+export function normalizeProtocol(p) {
+  if (p === null || p === undefined) return null;
+  let s = String(p).trim().toUpperCase();
+  if (s.length === 2 && s.charAt(0) === 'A') s = s.charAt(1);
+  if (s.length !== 1) return null;
+  if (s === '0') return null;
+  return s;
+}
+
+export function isCanProtocol(p) {
+  const n = normalizeProtocol(p);
+  return n !== null && CAN_PROTOCOLS.indexOf(n) !== -1;
+}
+
+function isLegacyProtocol(p) {
+  const n = normalizeProtocol(p);
+  return n !== null && LEGACY_PROTOCOLS.indexOf(n) !== -1;
+}
+
+function looksLegacyHeader(bytes) {
+  // ISO 9141 / J1850: 48 6B 10, 68 6B 10, 41 6B 10. KWP2000: 8x F1 10.
+  return bytes.length >= 5 && (bytes[1] === 0x6b || bytes[1] === 0xf1);
+}
+
+// ---------------------------------------------------------------------------
+// parseLines
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse ELM327 response lines into complete messages per ECU.
+ * @param {string[]|string} lines cleaned lines from Elm327.send (or a raw string)
+ * @param {string|number} [protocolNumber] from ATDPN, e.g. 'A6'
+ * @returns {{ecu:string, bytes:number[], proto:string, incomplete?:boolean}[]}
+ */
+export function parseLines(lines, protocolNumber) {
+  if (typeof lines === 'string') lines = lines.split(/[\r\n]+/);
+  if (!Array.isArray(lines)) return [];
+  const proto = normalizeProtocol(protocolNumber);
+  const knownCan = proto !== null && CAN_PROTOCOLS.indexOf(proto) !== -1;
+  const knownLegacy = proto !== null && LEGACY_PROTOCOLS.indexOf(proto) !== -1;
+
+  // Clean: strip spaces, uppercase, drop prompt chars and obvious status text.
+  const clean = [];
+  for (let i = 0; i < lines.length; i++) {
+    let l = lines[i];
+    if (l === null || l === undefined) continue;
+    l = String(l).replace(/[\s>]/g, '').toUpperCase();
+    if (!l) continue;
+    clean.push(l);
+  }
+
+  const hasMultiline = clean.some((l) => /^[0-9A-F]:[0-9A-F]*$/.test(l));
+  const out = [];
+  const canState = {}; // ecu -> {len, data}
+  let ml = null; // headers-off multiline state {len, data}
+
+  function flushMultiline() {
+    if (ml && ml.data.length) {
+      const bytes = ml.len ? ml.data.slice(0, ml.len) : ml.data;
+      const msg = { ecu: 'ECU', bytes, proto: knownLegacy ? 'legacy' : 'can' };
+      if (ml.len && ml.data.length < ml.len) msg.incomplete = true;
+      out.push(msg);
+    }
+    ml = null;
+  }
+
+  function canFrame(ecu, frame, protoTag) {
+    if (!frame.length) return;
+    const pci = frame[0];
+    const type = pci >> 4;
+    if (type === 0) {
+      let len = pci & 0x0f;
+      let start = 1;
+      if (len === 0 && frame.length > 1) { len = frame[1]; start = 2; } // CAN FD escape
+      const data = frame.slice(start, start + len);
+      out.push({ ecu, bytes: data, proto: protoTag });
+      delete canState[ecu];
+    } else if (type === 1) {
+      if (frame.length < 2) return;
+      if (canState[ecu]) finishCan(ecu, protoTag, true);
+      const len = ((pci & 0x0f) << 8) | frame[1];
+      canState[ecu] = { len, data: frame.slice(2), proto: protoTag };
+      if (canState[ecu].data.length >= len) finishCan(ecu, protoTag, false);
+    } else if (type === 2) {
+      const st = canState[ecu];
+      if (!st) return; // consecutive frame without a first frame, ignore
+      for (let i = 1; i < frame.length; i++) st.data.push(frame[i]);
+      if (st.data.length >= st.len) finishCan(ecu, protoTag, false);
+    }
+    // type 3 = flow control, ignore
+  }
+
+  function finishCan(ecu, protoTag, incomplete) {
+    const st = canState[ecu];
+    if (!st) return;
+    const msg = { ecu, bytes: st.data.slice(0, st.len), proto: st.proto || protoTag };
+    if (incomplete || st.data.length < st.len) msg.incomplete = true;
+    out.push(msg);
+    delete canState[ecu];
+  }
+
+  for (let i = 0; i < clean.length; i++) {
+    const l = clean[i];
+
+    // Headers-off multiline format: '014' then '0:490201...', '1:...'
+    if (hasMultiline) {
+      const m = /^([0-9A-F]):([0-9A-F]*)$/.exec(l);
+      if (m) {
+        if (!ml) ml = { len: 0, data: [] };
+        const b = hexToBytes(m[2]);
+        for (let j = 0; j < b.length; j++) ml.data.push(b[j]);
+        if (ml.len && ml.data.length >= ml.len) flushMultiline();
+        continue;
+      }
+      if (/^[0-9A-F]{3}$/.test(l)) {
+        flushMultiline();
+        ml = { len: parseInt(l, 16), data: [] };
+        continue;
+      }
+    }
+
+    if (!HEX_RE.test(l)) continue; // OK, NO DATA, SEARCHING..., errors, etc.
+
+    const odd = l.length % 2 === 1;
+    // 29-bit headers look like 18DAF110. Mode replies start with 4x or 7F, so a leading '1' is a header.
+    const is29 = !odd && l.length >= 10 && (/^18D[AB]/.test(l) || ((proto === '7' || proto === '9') && l.charAt(0) === '1'));
+
+    if (odd && !knownLegacy && l.length >= 5) {
+      // 11-bit CAN with header
+      canFrame(l.substr(0, 3), hexToBytes(l.substr(3)), 'can');
+      continue;
+    }
+    if (is29 && !knownLegacy) {
+      canFrame(l.substr(0, 8), hexToBytes(l.substr(8)), 'can');
+      continue;
+    }
+    if (odd) continue; // nothing sensible left
+
+    const bytes = hexToBytes(l);
+    if (!knownCan && looksLegacyHeader(bytes)) {
+      // priority/format, target, source, data..., checksum
+      out.push({ ecu: hex2(bytes[2]), bytes: bytes.slice(3, bytes.length - 1), proto: 'legacy' });
+      continue;
+    }
+
+    // Headers off, single line of data
+    out.push({ ecu: 'ECU', bytes, proto: knownLegacy ? 'legacy' : (knownCan ? 'can' : 'raw') });
+  }
+
+  flushMultiline();
+  Object.keys(canState).forEach((ecu) => finishCan(ecu, 'can', true));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// ECU names
+// ---------------------------------------------------------------------------
+
+export const ECU_NAMES = {
+  '7E8': 'Engine (ECM)',
+  '7E9': 'Transmission / Hybrid (TCM)',
+  '7EA': 'Module at 7EA (on Toyota hybrids usually the hybrid control computer)',
+  '7EB': 'Module at 7EB (often hybrid battery or other module)',
+  '7EC': 'Module at 7EC',
+  '7ED': 'Module at 7ED',
+  '7EE': 'Module at 7EE',
+  '7EF': 'Module at 7EF',
+  ECU: 'Car computer'
+};
+
+// Source addresses used by 29-bit CAN and by older (legacy) protocols.
+const SOURCE_NAMES = {
+  '10': 'Engine (ECM)',
+  '11': 'Engine (second module)',
+  '18': 'Transmission (TCM)',
+  '19': 'Transmission (second module)',
+  '1A': 'Module at address 1A (often hybrid control)',
+  '28': 'Brakes (ABS)'
+};
+
+export function ecuLabel(id) {
+  if (id === null || id === undefined) return 'Unknown module';
+  const s = String(id).toUpperCase();
+  if (ECU_NAMES[s]) return ECU_NAMES[s];
+  if (s.length === 8 && /^18DA/.test(s)) {
+    const src = s.substr(6, 2);
+    return SOURCE_NAMES[src] || ('Module at ' + s);
+  }
+  if (s.length === 2 && SOURCE_NAMES[s]) return SOURCE_NAMES[s];
+  return 'Module at ' + s;
+}
+
+function ecuRank(ecu) {
+  // Prefer the engine computer when picking a single answer.
+  if (ecu === '7E8' || ecu === '18DAF110' || ecu === '10') return 0;
+  if (ecu === 'ECU') return 1;
+  return 2;
+}
+
+function sortByEcu(list) {
+  return list.slice().sort((a, b) => {
+    const r = ecuRank(a.ecu) - ecuRank(b.ecu);
+    if (r) return r;
+    return a.ecu < b.ecu ? -1 : a.ecu > b.ecu ? 1 : 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// DTC decoding
+// ---------------------------------------------------------------------------
+
+export function decodeDtc(byteA, byteB) {
+  const letter = 'PCBU'.charAt((byteA >> 6) & 3);
+  const d1 = (byteA >> 4) & 3;
+  return (letter + d1 + (byteA & 0x0f).toString(16) + hex2(byteB)).toUpperCase();
+}
+
+/**
+ * Extract DTCs from mode 03/07/0A response messages.
+ * CAN: [0x4X, count, A, B, ...]. Legacy: [0x4X, A, B, A, B, A, B] per message, 0000 = padding.
+ * @returns {{ecu, label, codes:string[]}[]}
+ */
+export function parseDtcResponses(responses, isCan) {
+  const byEcu = {};
+  const order = [];
+  for (let i = 0; i < responses.length; i++) {
+    const r = responses[i];
+    const b = r.bytes;
+    if (!b || !b.length) continue;
+    let can = isCan;
+    if (r.proto === 'can') can = true;
+    else if (r.proto === 'legacy') can = false;
+    else if (can === undefined || can === null) {
+      // Heuristic: count byte matches number of pairs that follow
+      can = b.length >= 2 && (b.length - 2) % 2 === 0 && b[1] === (b.length - 2) / 2;
+    }
+    if (!byEcu[r.ecu]) { byEcu[r.ecu] = []; order.push(r.ecu); }
+    const codes = byEcu[r.ecu];
+    let start = 1;
+    let max = Infinity;
+    if (can) { start = 2; max = b[1]; }
+    let n = 0;
+    for (let j = start; j + 1 < b.length && n < max; j += 2) {
+      if (b[j] === 0 && b[j + 1] === 0) continue;
+      const code = decodeDtc(b[j], b[j + 1]);
+      n++;
+      if (codes.indexOf(code) === -1) codes.push(code);
+    }
+  }
+  return sortByEcu(order.map((ecu) => ({ ecu, label: ecuLabel(ecu), codes: byEcu[ecu] })));
+}
+
+// ---------------------------------------------------------------------------
+// VIN
+// ---------------------------------------------------------------------------
+
+/** @returns {{vin:string|null, ecu:string|null}} from mode 09 PID 02 messages */
+export function parseVin(responses) {
+  const groups = {};
+  const order = [];
+  responses.forEach((r) => {
+    if (!r.bytes || r.bytes[0] !== 0x49 || r.bytes[1] !== 0x02) return;
+    if (!groups[r.ecu]) { groups[r.ecu] = []; order.push(r.ecu); }
+    groups[r.ecu].push(r.bytes);
+  });
+  const ecus = sortByEcu(order.map((ecu) => ({ ecu })));
+  let best = null;
+  for (let i = 0; i < ecus.length; i++) {
+    const msgs = groups[ecus[i].ecu];
+    let data = [];
+    if (msgs.length === 1) {
+      data = msgs[0].slice(2);
+    } else {
+      // Legacy: several messages, each 49 02 seq b1 b2 b3 b4
+      msgs.slice().sort((a, b) => a[2] - b[2]).forEach((m) => { data = data.concat(m.slice(3)); });
+    }
+    let s = '';
+    data.forEach((c) => { if (c >= 0x30 && c <= 0x5a) s += String.fromCharCode(c); });
+    s = s.replace(/[^A-Z0-9]/g, '');
+    if (s.length > 17) s = s.substr(s.length - 17);
+    if (!s) continue;
+    if (s.length === 17) return { vin: s, ecu: ecus[i].ecu };
+    if (!best) best = { vin: s, ecu: ecus[i].ecu };
+  }
+  return best || { vin: null, ecu: null };
+}
+
+// ---------------------------------------------------------------------------
+// Supported PID bitmaps
+// ---------------------------------------------------------------------------
+
+/** 4 bitmap bytes for block starting at base → array of supported PID numbers */
+export function parseSupportedBitmap(base, dataBytes) {
+  const out = [];
+  for (let i = 0; i < 32; i++) {
+    const byte = dataBytes[i >> 3];
+    if (byte === undefined) break;
+    if (byte & (0x80 >> (i & 7))) out.push(base + i + 1);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Readiness monitors (SAE J1979 PID 01 / PID 41)
+// ---------------------------------------------------------------------------
+
+// Byte B: bits 0-2 available (misfire, fuel, components), bits 4-6 incomplete, bit 3 ignition type.
+const CONTINUOUS = [
+  { key: 'misfire', bit: 0, name: 'Misfire monitor', explain: 'Watches for engine misfires all the time while driving.' },
+  { key: 'fuelSystem', bit: 1, name: 'Fuel system', explain: 'Checks that the engine gets the right fuel mixture.' },
+  { key: 'components', bit: 2, name: 'Comprehensive components', explain: 'Checks sensors and actuators for electrical faults.' }
+];
+// Byte C available, byte D incomplete.
+const SPARK = [
+  { key: 'catalyst', bit: 0, name: 'Catalytic converter', explain: 'Checks the catalytic converter is still cleaning the exhaust properly.' },
+  { key: 'heatedCatalyst', bit: 1, name: 'Heated catalyst', explain: 'Checks the electrically heated catalyst (few cars have one).' },
+  { key: 'evap', bit: 2, name: 'Evaporative system (fuel vapour)', explain: 'Checks the fuel tank and vapour system for leaks. Often the last monitor to finish.' },
+  { key: 'secondaryAir', bit: 3, name: 'Secondary air system', explain: 'Checks the air pump that helps warm up the catalyst on cold starts.' },
+  { key: 'acRefrigerant', bit: 4, name: 'A/C refrigerant', explain: 'Checks the air conditioning refrigerant system (rarely used).' },
+  { key: 'o2Sensor', bit: 5, name: 'Oxygen sensors', explain: 'Checks the oxygen sensors that measure the exhaust.' },
+  { key: 'o2Heater', bit: 6, name: 'Oxygen sensor heaters', explain: 'Checks the heaters that bring the oxygen sensors up to temperature.' },
+  { key: 'egr', bit: 7, name: 'EGR and/or VVT system', explain: 'Checks exhaust gas recirculation and/or variable valve timing.' }
+];
+const COMPRESSION = [
+  { key: 'nmhcCatalyst', bit: 0, name: 'NMHC catalyst', explain: 'Checks the diesel oxidation catalyst that burns off unburnt fuel.' },
+  { key: 'noxScr', bit: 1, name: 'NOx aftertreatment (SCR / NOx trap)', explain: 'Checks the system that removes nitrogen oxides (often uses AdBlue).' },
+  { key: 'boostPressure', bit: 3, name: 'Boost pressure', explain: 'Checks the turbo boost pressure control.' },
+  { key: 'exhaustSensor', bit: 5, name: 'Exhaust gas sensor', explain: 'Checks the exhaust gas sensors.' },
+  { key: 'pmFilter', bit: 6, name: 'Particulate filter (DPF)', explain: 'Checks the diesel particulate filter that traps soot.' },
+  { key: 'egrVvt', bit: 7, name: 'EGR and/or VVT system', explain: 'Checks exhaust gas recirculation and/or variable valve timing.' }
+];
+
+// MONITORS comes from pids.js. Its exact shape is not fixed by the spec, so look up loosely.
+function monitorMeta(def, ignition) {
+  let m = null;
+  try {
+    if (MONITORS) {
+      const pools = [MONITORS[ignition], MONITORS, MONITORS.common, MONITORS.continuous];
+      for (let i = 0; i < pools.length && !m; i++) {
+        const p = pools[i];
+        if (!p || typeof p !== 'object') continue;
+        if (Array.isArray(p)) {
+          m = p.find((x) => x && (x.key === def.key || x.id === def.key)) || null;
+        } else if (p[def.key] && typeof p[def.key] === 'object') {
+          m = p[def.key];
+        }
+      }
+    }
+  } catch (e) { m = null; }
+  return {
+    name: (m && typeof m.name === 'string' && m.name) || def.name,
+    explain: (m && typeof m.explain === 'string' && m.explain) || def.explain
+  };
+}
+
+/**
+ * Decode 4 data bytes A B C D of PID 01 (or PID 41 when thisDrive is true).
+ * For PID 41 "available" means enabled for this drive cycle.
+ */
+export function parseReadiness(data, thisDrive) {
+  const A = data[0] || 0, B = data[1] || 0, C = data[2] || 0, D = data[3] || 0;
+  const ignition = (B & 0x08) ? 'compression' : 'spark';
+  const monitors = [];
+  CONTINUOUS.forEach((def) => {
+    const meta = monitorMeta(def, ignition);
+    const available = !!(B & (1 << def.bit));
+    const incomplete = !!(B & (1 << (def.bit + 4)));
+    monitors.push({ key: def.key, name: meta.name, explain: meta.explain, continuous: true, available, complete: available ? !incomplete : null });
+  });
+  (ignition === 'compression' ? COMPRESSION : SPARK).forEach((def) => {
+    const meta = monitorMeta(def, ignition);
+    const available = !!(C & (1 << def.bit));
+    const incomplete = !!(D & (1 << def.bit));
+    monitors.push({ key: def.key, name: meta.name, explain: meta.explain, continuous: false, available, complete: available ? !incomplete : null });
+  });
+  const res = { ignition, monitors };
+  if (!thisDrive) {
+    res.milOn = !!(A & 0x80);
+    res.dtcCount = A & 0x7f;
+  }
+  return res;
+}
+
+// Combine several ECUs answering 0101: MIL on if any, counts summed,
+// a monitor is available if any ECU supports it, complete only if all supporting ECUs say complete.
+function combineReadiness(list) {
+  const base = list[0];
+  const out = { milOn: false, dtcCount: 0, ignition: base.ignition, monitors: base.monitors.map((m) => Object.assign({}, m)) };
+  list.forEach((r) => {
+    if (r.milOn) out.milOn = true;
+    out.dtcCount += r.dtcCount || 0;
+  });
+  out.monitors.forEach((m) => {
+    let available = false;
+    let complete = true;
+    list.forEach((r) => {
+      if (r.ignition !== base.ignition) return;
+      const o = r.monitors.find((x) => x.key === m.key);
+      if (o && o.available) { available = true; if (!o.complete) complete = false; }
+    });
+    m.available = available;
+    m.complete = available ? complete : null;
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-PID splitting
+// ---------------------------------------------------------------------------
+
+function pidByteLength(pid) {
+  const d = PIDS && PIDS[pid];
+  if (d && typeof d.bytes === 'number' && d.bytes > 0) return d.bytes;
+  return null;
+}
+
+/** Split a mode 01 multi-PID reply [0x41, pid, data..., pid, data...] into {pid: bytes}. null if not splittable. */
+export function splitMultiPid(bytes, requested) {
+  if (!bytes || bytes[0] !== 0x41) return null;
+  const out = {};
+  let i = 1;
+  while (i < bytes.length) {
+    const pid = bytes[i];
+    if (requested && requested.indexOf(pid) === -1) {
+      // Probably padding after the last value
+      if (Object.keys(out).length) break;
+      return null;
+    }
+    const len = pidByteLength(pid);
+    if (!len) return null;
+    if (i + 1 + len > bytes.length) return null;
+    out[pid] = bytes.slice(i + 1, i + 1 + len);
+    i += 1 + len;
+  }
+  return out;
+}
+
+function safeDecode(pid, data) {
+  try {
+    const r = decodePid(pid, data);
+    if (r && typeof r === 'object') return r;
+  } catch (e) { /* fall through */ }
+  return { value: null, unit: '', text: data.map(hex2).join(' ') };
+}
+
+function pidName(pid) {
+  const d = PIDS && PIDS[pid];
+  return (d && d.name) || ('PID ' + hex2(pid));
+}
+
+function safeDescribe(code) {
+  try { return describeDtc(code); } catch (e) { return { code, description: '', explain: '', severity: null }; }
+}
+
+const NOT_SUPPORTED = 'Not supported by this car';
+
+// ---------------------------------------------------------------------------
+// Obd class
+// ---------------------------------------------------------------------------
+
+export class Obd {
+  constructor(elm) {
+    this.elm = elm;
+    this.protocolNumber = null; // set by app from init(), or detected via ATDPN
+    this.supported = null;      // cache from supportedPids()
+    this._multiPidOk = null;    // null unknown, true works, false do not use
+    this._multiPidFails = 0;
+  }
+
+  async _protocol() {
+    if (this.protocolNumber && normalizeProtocol(this.protocolNumber)) return this.protocolNumber;
+    try {
+      const r = await this.elm.send('ATDPN');
+      if (r && r.status === 'ok' && r.lines && r.lines.length) {
+        const p = r.lines[r.lines.length - 1].trim();
+        if (normalizeProtocol(p)) this.protocolNumber = p;
+      }
+    } catch (e) { /* ignore */ }
+    return this.protocolNumber;
+  }
+
+  async isCan() {
+    const p = await this._protocol();
+    if (p === null) return null;
+    return isCanProtocol(p);
+  }
+
+  async query(cmdHex, opts) {
+    const cmd = String(cmdHex).replace(/\s+/g, '').toUpperCase();
+    const proto = await this._protocol();
+    let r;
+    try {
+      r = await this.elm.send(cmd, opts);
+    } catch (e) {
+      return { status: 'error', message: 'The adapter did not respond properly. ' + (e && e.message ? e.message : ''), responses: [], negative: [] };
+    }
+    if (!r || r.status !== 'ok') {
+      return { status: (r && r.status) || 'error', message: (r && r.message) || 'No answer from the adapter.', responses: [], negative: [], raw: r && r.raw };
+    }
+    const mode = parseInt(cmd.substr(0, 2), 16);
+    const parsed = parseLines(r.lines || [], proto);
+    const responses = [];
+    const negative = [];
+    parsed.forEach((m) => {
+      if (!m.bytes.length) return;
+      if (m.bytes[0] === mode + 0x40) responses.push(m);
+      else if (m.bytes[0] === 0x7f && m.bytes[1] === mode) negative.push({ ecu: m.ecu, nrc: m.bytes[2] });
+    });
+    if (responses.length) return { status: 'ok', message: '', responses, negative, raw: r.raw };
+    if (negative.length) {
+      return { status: 'unsupported', message: NOT_SUPPORTED + '.', responses, negative, raw: r.raw };
+    }
+    return { status: 'nodata', message: 'The car sent a reply that this app could not read.', responses, negative, raw: r.raw };
+  }
+
+  async supportedPids() {
+    const byEcu = {};
+    const all = new Set();
+    let base = 0;
+    let status = 'ok';
+    let message = '';
+    while (base <= 0xe0) {
+      const q = await this.query('01' + hex2(base));
+      if (q.status !== 'ok') {
+        if (base === 0) { status = q.status; message = q.message; }
+        break;
+      }
+      let more = false;
+      q.responses.forEach((m) => {
+        if (m.bytes[1] !== base) return;
+        const pids = parseSupportedBitmap(base, m.bytes.slice(2, 6));
+        if (!byEcu[m.ecu]) byEcu[m.ecu] = new Set();
+        pids.forEach((p) => { byEcu[m.ecu].add(p); all.add(p); });
+        if (pids.indexOf(base + 0x20) !== -1) more = true;
+      });
+      if (!more) break;
+      base += 0x20;
+    }
+    const res = { byEcu, all, status, message };
+    if (status === 'ok') this.supported = res;
+    return res;
+  }
+
+  _isSupported(pid) {
+    if (!this.supported || !this.supported.all || !this.supported.all.size) return null;
+    return this.supported.all.has(pid);
+  }
+
+  async readDtcs(mode) {
+    const m = String(mode || '03').toUpperCase();
+    const q = await this.query(m);
+    const can = await this.isCan();
+    if (q.status === 'ok') {
+      const byEcu = parseDtcResponses(q.responses, can === null ? undefined : can);
+      byEcu.forEach((e) => { e.details = e.codes.map(safeDescribe); });
+      const total = byEcu.reduce((n, e) => n + e.codes.length, 0);
+      return { status: 'ok', supported: true, message: total ? '' : 'No codes reported.', byEcu };
+    }
+    if (q.status === 'unsupported' || (m === '0A' && q.status === 'nodata')) {
+      return { status: q.status, supported: false, message: NOT_SUPPORTED, byEcu: [] };
+    }
+    if (q.status === 'nodata') {
+      return {
+        status: 'ok', supported: true, byEcu: [],
+        message: 'The car did not answer this request. This usually means there are no codes of this type.'
+      };
+    }
+    return { status: q.status, supported: false, message: q.message, byEcu: [] };
+  }
+
+  async clearDtcs() {
+    const q = await this.query('04', { timeout: 8000 });
+    if (q.status === 'ok') {
+      return { ok: true, message: 'Codes cleared. If the fault is still there, the check engine light will come back.' };
+    }
+    if (q.status === 'unsupported') {
+      const nrc = q.negative.length ? q.negative[0].nrc : null;
+      if (nrc === 0x22) {
+        return { ok: false, message: 'The car refused to clear codes right now. Most cars only allow this with the ignition on and the engine off.' };
+      }
+      return { ok: false, message: 'The car refused the request to clear codes.' };
+    }
+    if (q.status === 'nodata') {
+      return { ok: false, message: 'The car did not confirm the clear. Read the codes again to check whether they are gone.' };
+    }
+    return { ok: false, message: q.message || 'Clearing codes failed.' };
+  }
+
+  async readVin() {
+    const q = await this.query('0902', { timeout: 6000 });
+    if (q.status !== 'ok') {
+      const ns = q.status === 'nodata' || q.status === 'unsupported';
+      return { vin: null, ecu: null, status: q.status, message: ns ? NOT_SUPPORTED + '. Older cars often do not report the VIN.' : q.message };
+    }
+    const v = parseVin(q.responses);
+    if (!v.vin) return { vin: null, ecu: null, status: 'nodata', message: 'The car answered but did not include a readable VIN.' };
+    const msg = v.vin.length === 17 ? '' : 'The VIN looks incomplete. Compare it with the plate on the car.';
+    return { vin: v.vin, ecu: v.ecu, status: 'ok', message: msg };
+  }
+
+  async readiness() {
+    const q = await this.query('0101');
+    if (q.status !== 'ok') {
+      return { status: q.status, message: q.message, milOn: null, dtcCount: null, ignition: null, monitors: [], thisDrive: null };
+    }
+    const list = sortByEcu(q.responses.filter((m) => m.bytes[1] === 0x01 && m.bytes.length >= 6))
+      .map((m) => Object.assign({ ecu: m.ecu }, parseReadiness(m.bytes.slice(2, 6), false)));
+    if (!list.length) {
+      return { status: 'nodata', message: 'The car sent a reply that this app could not read.', milOn: null, dtcCount: null, ignition: null, monitors: [], thisDrive: null };
+    }
+    const res = list.length === 1 ? list[0] : combineReadiness(list);
+    const out = { status: 'ok', message: '', milOn: res.milOn, dtcCount: res.dtcCount, ignition: res.ignition, monitors: res.monitors, thisDrive: null, byEcu: list };
+
+    if (this._isSupported(0x41) !== false) {
+      const q2 = await this.query('0141');
+      if (q2.status === 'ok') {
+        const m = sortByEcu(q2.responses.filter((x) => x.bytes[1] === 0x41 && x.bytes.length >= 6))[0];
+        if (m) {
+          const d = m.bytes.slice(2, 6);
+          d[1] = (d[1] & 0xf7) | (res.ignition === 'compression' ? 0x08 : 0); // use ignition type from PID 01
+          out.thisDrive = parseReadiness(d, true).monitors.map((x) => Object.assign(x, { enabled: x.available }));
+        }
+      }
+    }
+    return out;
+  }
+
+  async readPid(pid) {
+    const p = typeof pid === 'string' ? parseInt(pid, 16) : pid;
+    const q = await this.query('01' + hex2(p));
+    if (q.status !== 'ok') {
+      const ns = q.status === 'nodata' || q.status === 'unsupported';
+      return { pid: p, ecu: null, value: null, unit: '', text: ns ? NOT_SUPPORTED : '', status: q.status, message: ns ? NOT_SUPPORTED : q.message };
+    }
+    const m = sortByEcu(q.responses.filter((x) => x.bytes[1] === p))[0];
+    if (!m) return { pid: p, ecu: null, value: null, unit: '', text: '', status: 'nodata', message: 'The car sent a reply that this app could not read.' };
+    const d = safeDecode(p, m.bytes.slice(2));
+    return { pid: p, ecu: m.ecu, value: d.value, unit: d.unit || '', text: d.text, status: 'ok', message: '' };
+  }
+
+  async readPids(pidList) {
+    const pids = (pidList || []).map((p) => (typeof p === 'string' ? parseInt(p, 16) : p));
+    const results = {};
+    const can = await this.isCan();
+    const useMulti = can === true && this._multiPidOk !== false;
+
+    if (useMulti) {
+      for (let i = 0; i < pids.length; i += 6) {
+        const chunk = pids.slice(i, i + 6);
+        if (chunk.length === 1 || chunk.some((p) => !pidByteLength(p))) {
+          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j]);
+          continue;
+        }
+        const q = await this.query('01' + chunk.map(hex2).join(''));
+        let got = 0;
+        if (q.status === 'ok') {
+          sortByEcu(q.responses).forEach((m) => {
+            const split = splitMultiPid(m.bytes, chunk);
+            if (!split) return;
+            Object.keys(split).forEach((k) => {
+              const p = parseInt(k, 10);
+              if (results[p]) return; // first (preferred) ECU wins
+              const d = safeDecode(p, split[k]);
+              results[p] = { pid: p, ecu: m.ecu, value: d.value, unit: d.unit || '', text: d.text, status: 'ok', message: '' };
+              got++;
+            });
+          });
+        }
+        if (got) {
+          this._multiPidOk = true;
+          this._multiPidFails = 0;
+          chunk.forEach((p) => {
+            if (!results[p]) results[p] = { pid: p, ecu: null, value: null, unit: '', text: NOT_SUPPORTED, status: 'nodata', message: NOT_SUPPORTED };
+          });
+        } else {
+          if (q.status === 'ok' || q.status === 'unknown' || q.status === 'nodata') {
+            this._multiPidFails++;
+            if (this._multiPidOk !== true || this._multiPidFails >= 3) this._multiPidOk = false;
+          }
+          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j]);
+        }
+      }
+    } else {
+      for (let j = 0; j < pids.length; j++) results[pids[j]] = await this.readPid(pids[j]);
+    }
+    return pids.map((p) => results[p]);
+  }
+
+  async freezeFrame() {
+    const q = await this.query('0202');
+    let dtc = null;
+    if (q.status === 'ok') {
+      const m = sortByEcu(q.responses.filter((x) => x.bytes[1] === 0x02 && x.bytes.length >= 5))[0];
+      if (m && (m.bytes[3] || m.bytes[4])) dtc = decodeDtc(m.bytes[3], m.bytes[4]);
+    }
+
+    // Which PIDs are stored in frame 0
+    let supported = null;
+    let base = 0;
+    while (base <= 0x40) {
+      const b = await this.query('02' + hex2(base) + '00');
+      if (b.status !== 'ok') break;
+      let more = false;
+      b.responses.forEach((m) => {
+        if (m.bytes[1] !== base) return;
+        if (!supported) supported = new Set();
+        const list = parseSupportedBitmap(base, m.bytes.slice(3, 7));
+        list.forEach((p) => supported.add(p));
+        if (list.indexOf(base + 0x20) !== -1) more = true;
+      });
+      if (!more) break;
+      base += 0x20;
+    }
+
+    const COMMON = [0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x1f, 0x2f, 0x33, 0x42, 0x43, 0x44, 0x45, 0x46, 0x5c];
+    const wanted = COMMON.filter((p) => (supported ? supported.has(p) : true));
+    const values = [];
+    let failures = 0;
+    for (let i = 0; i < wanted.length; i++) {
+      const p = wanted[i];
+      const r = await this.query('02' + hex2(p) + '00');
+      if (r.status !== 'ok') {
+        failures++;
+        if (!supported && failures >= 3 && !values.length) break; // car clearly has no freeze frame
+        continue;
+      }
+      const m = sortByEcu(r.responses.filter((x) => x.bytes[1] === p))[0];
+      if (!m) continue;
+      const d = safeDecode(p, m.bytes.slice(3));
+      values.push({ pid: p, name: pidName(p), value: d.value, unit: d.unit || '', text: d.text });
+    }
+
+    if (!dtc && !values.length) {
+      const msg = q.status === 'ok' || q.status === 'nodata' || q.status === 'unsupported'
+        ? 'No freeze frame stored. The car saves one when a fault turns on the check engine light.'
+        : q.message;
+      return { dtc: null, values: [], status: q.status === 'ok' ? 'nodata' : q.status, message: msg };
+    }
+    return { dtc, dtcInfo: dtc ? safeDescribe(dtc) : null, values, status: 'ok', message: '' };
+  }
+
+  async usedCarCheck(onProgress) {
+    const steps = [
+      'Checking which data this car supports',
+      'Reading VIN',
+      'Reading readiness monitors',
+      'Reading distance and time since codes were cleared',
+      'Reading stored codes',
+      'Reading pending codes',
+      'Reading permanent codes'
+    ];
+    let step = 0;
+    const progress = (label) => {
+      step++;
+      if (typeof onProgress === 'function') {
+        try { onProgress({ step, total: steps.length, label: label || steps[step - 1] }); } catch (e) { /* ignore UI errors */ }
+      }
+    };
+
+    progress();
+    if (!this.supported) await this.supportedPids();
+    progress();
+    const vin = await this.readVin();
+    progress();
+    const readiness = await this.readiness();
+    progress();
+
+    const ITEMS = [
+      { pid: 0x31, key: 'distanceSinceClear', label: 'Distance since codes were cleared' },
+      { pid: 0x4e, key: 'timeSinceClear', label: 'Engine run time since codes were cleared' },
+      { pid: 0x30, key: 'warmupsSinceClear', label: 'Warm-ups since codes were cleared' },
+      { pid: 0x21, key: 'distanceWithMil', label: 'Distance driven with the check engine light on' },
+      { pid: 0x4d, key: 'timeWithMil', label: 'Engine run time with the check engine light on' },
+      { pid: 0xa6, key: 'odometer', label: 'Odometer (from the engine computer)', onlyIfSupported: true }
+    ];
+    const items = [];
+    const vals = {};
+    for (let i = 0; i < ITEMS.length; i++) {
+      const it = ITEMS[i];
+      const sup = this._isSupported(it.pid);
+      if (sup === false || (it.onlyIfSupported && sup !== true)) {
+        items.push({ key: it.key, pid: it.pid, label: it.label, supported: false, value: null, unit: '', text: NOT_SUPPORTED });
+        continue;
+      }
+      const r = await this.readPid(it.pid);
+      if (r.status === 'ok') {
+        const num = typeof r.value === 'number' ? r.value : parseFloat(r.value);
+        vals[it.key] = isNaN(num) ? null : num;
+        items.push({ key: it.key, pid: it.pid, label: it.label, supported: true, value: r.value, unit: r.unit, text: r.text });
+      } else {
+        const ns = r.status === 'nodata' || r.status === 'unsupported';
+        items.push({ key: it.key, pid: it.pid, label: it.label, supported: !ns ? null : false, value: null, unit: '', text: ns ? NOT_SUPPORTED : (r.message || 'Could not read') });
+      }
+    }
+
+    progress();
+    const stored = await this.readDtcs('03');
+    progress();
+    const pending = await this.readDtcs('07');
+    progress();
+    const permanent = await this.readDtcs('0A');
+
+    const flags = buildUsedCarFlags({ vin, readiness, vals, items, stored, pending, permanent });
+    return { vin, readiness, items, dtcs: { stored, pending, permanent }, flags };
+  }
+}
+
+function countCodes(r) {
+  if (!r || !r.byEcu) return 0;
+  return r.byEcu.reduce((n, e) => n + e.codes.length, 0);
+}
+
+function listCodes(r) {
+  const out = [];
+  (r && r.byEcu ? r.byEcu : []).forEach((e) => e.codes.forEach((c) => { if (out.indexOf(c) === -1) out.push(c); }));
+  return out.join(', ');
+}
+
+/** Pure: turn used car check results into plain-English findings. */
+export function buildUsedCarFlags(d) {
+  const flags = [];
+  const vals = d.vals || {};
+  const rd = d.readiness || {};
+
+  if (typeof rd.milOn === 'boolean') {
+    if (rd.milOn) flags.push({ level: 'warn', text: 'The check engine light is ON. The car has detected a fault that affects emissions or engine running.' });
+    else flags.push({ level: 'ok', text: 'The check engine light is off.' });
+  }
+
+  const nStored = countCodes(d.stored);
+  const nPending = countCodes(d.pending);
+  const nPerm = countCodes(d.permanent);
+  if (nStored) flags.push({ level: 'warn', text: nStored + ' stored trouble code' + (nStored > 1 ? 's' : '') + ' (' + listCodes(d.stored) + '). These are confirmed faults.' });
+  if (nPending) flags.push({ level: 'warn', text: nPending + ' pending code' + (nPending > 1 ? 's' : '') + ' (' + listCodes(d.pending) + '). The car has seen a possible fault that is not yet confirmed.' });
+  if (nPerm) flags.push({ level: 'warn', text: nPerm + ' permanent code' + (nPerm > 1 ? 's' : '') + ' (' + listCodes(d.permanent) + '). These cannot be erased with a scan tool. They go away only after the car confirms the repair by itself.' });
+  if (d.permanent && d.permanent.supported === false) flags.push({ level: 'info', text: 'Permanent codes: not supported by this car.' });
+  const allRead = d.stored && d.stored.status === 'ok' && d.pending && d.pending.status === 'ok';
+  if (allRead && !nStored && !nPending && !nPerm) flags.push({ level: 'ok', text: 'No stored or pending trouble codes.' });
+
+  // Recently cleared?
+  const reasons = [];
+  if (typeof vals.distanceSinceClear === 'number' && vals.distanceSinceClear < 200) reasons.push('only ' + vals.distanceSinceClear + ' km driven since then');
+  if (typeof vals.warmupsSinceClear === 'number' && vals.warmupsSinceClear < 20) reasons.push('only ' + vals.warmupsSinceClear + ' warm-ups since then');
+  if (typeof vals.timeSinceClear === 'number' && vals.timeSinceClear < 300) reasons.push('only ' + vals.timeSinceClear + ' minutes of engine running since then');
+
+  const mons = (rd.monitors || []).filter((m) => m.available && !m.continuous);
+  const incomplete = mons.filter((m) => m.complete === false);
+  if (reasons.length) {
+    flags.push({ level: 'warn', text: 'Codes were probably cleared recently (' + reasons.join(', ') + '). Clearing codes can hide a problem. Ask the seller why, and check again after some driving.' });
+  }
+  if (incomplete.length >= 2) {
+    flags.push({ level: 'warn', text: incomplete.length + ' readiness monitors are not finished (' + incomplete.map((m) => m.name).join(', ') + '). This often means the codes were cleared or the battery was disconnected recently.' });
+  } else if (incomplete.length === 1) {
+    flags.push({ level: 'info', text: 'One readiness monitor is not finished (' + incomplete[0].name + '). One incomplete monitor is fairly common, especially the fuel vapour (EVAP) test.' });
+  } else if (mons.length) {
+    flags.push({ level: 'ok', text: 'All readiness monitors are complete. This suggests codes were not cleared recently.' });
+  }
+
+  if (typeof vals.distanceWithMil === 'number' && vals.distanceWithMil > 0) {
+    flags.push({ level: 'warn', text: 'The car has been driven ' + vals.distanceWithMil + ' km with the check engine light on.' });
+  }
+
+  if (typeof vals.odometer === 'number') {
+    flags.push({ level: 'info', text: 'Odometer stored in the engine computer: ' + vals.odometer + ' km. Compare it with the dashboard reading.' });
+  }
+
+  if (d.vin && d.vin.vin) flags.push({ level: 'info', text: 'VIN reported by the car: ' + d.vin.vin + '. Check it matches the plate on the car and the paperwork.' });
+  else if (d.vin) flags.push({ level: 'info', text: 'VIN: not supported by this car (common on older cars).' });
+
+  const unsupported = (d.items || []).filter((it) => it.supported === false).map((it) => it.label);
+  if (unsupported.length) flags.push({ level: 'info', text: 'Not supported by this car: ' + unsupported.join(', ') + '. This is normal and not a fault.' });
+
+  return flags;
+}

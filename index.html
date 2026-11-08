@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="Private OBD-II car diagnostics in your browser. Reads trouble codes, readiness and live data over a Bluetooth adapter. Nothing leaves your phone.">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>OBD Web</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M14 40a18 18 0 0 1 36 0' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M32 40l9-11' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='40' r='4' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-name">OBD Web</span>
+        <span class="badge badge-privacy" title="All data stays in this page">Nothing leaves your phone</span>
+      </div>
+      <div id="statusPill" class="pill pill-idle" role="status" aria-live="polite">Not connected</div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- 1. Connect -->
+    <section class="card" id="card-connect" aria-labelledby="h-connect">
+      <h2 id="h-connect"><span class="step">1</span> Connect</h2>
+      <p class="lead" data-lead="connect"></p>
+
+      <div id="noBtBox" class="notice notice-warn" hidden>
+        <strong data-text="noBtTitle"></strong>
+        <p data-text="noBtText"></p>
+      </div>
+
+      <p id="statusLine" class="status-line" aria-live="polite">Not connected. Follow the steps below, then tap Connect adapter.</p>
+      <div id="connectInfo" class="kv" hidden></div>
+      <div id="connectMsg" class="msg" hidden></div>
+
+      <div class="btn-col">
+        <button id="btnConnect" class="btn btn-primary" type="button">Connect adapter</button>
+        <button id="btnRetry" class="btn btn-secondary" type="button" hidden>Ask the car again</button>
+        <div class="sim-row">
+          <button id="btnSim" class="btn btn-secondary" type="button">Try simulated car</button>
+          <label class="select-wrap">
+            <span class="sr-only">Simulated car scenario</span>
+            <select id="simScenario">
+              <option value="normal">Normal car</option>
+              <option value="ignitionOff">Ignition off</option>
+              <option value="legacy">Older car (pre CAN)</option>
+            </select>
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="btnProbe" class="btn btn-ghost" type="button">Probe adapter</button>
+          <button id="btnDisconnect" class="btn btn-ghost" type="button">Disconnect</button>
+        </div>
+      </div>
+      <div id="probeOut" class="out" hidden></div>
+      <div data-explain="connect"></div>
+    </section>
+
+    <!-- 2. Used car check -->
+    <section class="card" id="card-check" aria-labelledby="h-check">
+      <h2 id="h-check"><span class="step">2</span> Used car check</h2>
+      <p class="lead" data-lead="check"></p>
+      <button id="btnCheck" class="btn btn-primary btn-big" type="button">Run used car check</button>
+      <div id="checkProgress" class="progress" hidden>
+        <div class="progress-bar"><div id="checkBar" class="progress-fill"></div></div>
+        <p id="checkStep" class="muted small" aria-live="polite"></p>
+      </div>
+      <div id="checkOut" class="out"></div>
+      <div data-explain="check"></div>
+    </section>
+
+    <!-- 3. Trouble codes -->
+    <section class="card" id="card-codes" aria-labelledby="h-codes">
+      <h2 id="h-codes"><span class="step">3</span> Trouble codes</h2>
+      <p class="lead" data-lead="codes"></p>
+      <div class="btn-row">
+        <button id="btnRead" class="btn btn-primary" type="button">Read codes</button>
+        <button id="btnClear" class="btn btn-danger" type="button">Clear codes</button>
+      </div>
+      <button id="btnReadiness" class="btn btn-ghost btn-block" type="button">Check readiness monitors</button>
+      <div id="codesOut" class="out"></div>
+      <div id="readinessOut" class="out"></div>
+      <div data-explain="codes"></div>
+    </section>
+
+    <!-- 4. Freeze frame -->
+    <section class="card" id="card-freeze" aria-labelledby="h-freeze">
+      <h2 id="h-freeze"><span class="step">4</span> Freeze frame</h2>
+      <p class="lead" data-lead="freeze"></p>
+      <button id="btnFreeze" class="btn btn-primary btn-block" type="button">Read freeze frame</button>
+      <div id="freezeOut" class="out"></div>
+      <div data-explain="freeze"></div>
+    </section>
+
+    <!-- 5. Live data -->
+    <section class="card" id="card-live" aria-labelledby="h-live">
+      <h2 id="h-live"><span class="step">5</span> Live data</h2>
+      <p class="lead" data-lead="live"></p>
+      <div class="btn-row">
+        <button id="btnLive" class="btn btn-primary" type="button">Start live data</button>
+        <span id="liveRate" class="muted small rate" aria-live="off"></span>
+      </div>
+      <details id="pickerBox" class="picker">
+        <summary>Choose readings</summary>
+        <p class="muted small">Only readings this car supports are listed. Fewer readings update faster.</p>
+        <div id="pickerList" class="picker-list"></div>
+      </details>
+      <div id="liveMsg" class="msg" hidden></div>
+      <div id="tiles" class="tiles" aria-live="off"></div>
+      <div id="tileExplain" class="notice notice-info" hidden></div>
+      <div data-explain="live"></div>
+    </section>
+
+    <!-- 6. Report -->
+    <section class="card" id="card-report" aria-labelledby="h-report">
+      <h2 id="h-report"><span class="step">6</span> Report</h2>
+      <p class="lead" data-lead="report"></p>
+      <label class="check">
+        <input id="includeVin" type="checkbox">
+        <span>Include VIN (identifies the car)</span>
+      </label>
+      <button id="btnReport" class="btn btn-primary btn-block" type="button">Build report</button>
+      <div id="reportBox" hidden>
+        <label for="reportText" class="sr-only">Report text</label>
+        <textarea id="reportText" class="report-text" rows="14" spellcheck="false"></textarea>
+        <div class="btn-row">
+          <button id="btnShare" class="btn btn-primary" type="button">Share</button>
+          <button id="btnCopyReport" class="btn btn-secondary" type="button">Copy</button>
+        </div>
+        <p id="reportMsg" class="muted small" aria-live="polite"></p>
+      </div>
+      <div data-explain="report"></div>
+    </section>
+
+    <!-- 7. Debug console -->
+    <section class="card" id="card-console" aria-labelledby="h-console">
+      <details id="consoleBox" class="console-box">
+        <summary><h2 id="h-console">Debug console</h2></summary>
+        <p class="muted small" data-text="consoleHelp"></p>
+        <div class="btn-row">
+          <button id="btnCopyLog" class="btn btn-secondary" type="button">Copy log</button>
+          <button id="btnClearLog" class="btn btn-ghost" type="button">Clear</button>
+        </div>
+        <label class="check small">
+          <input id="autoScroll" type="checkbox" checked>
+          <span>Auto-scroll to newest</span>
+        </label>
+        <pre id="logView" class="log" tabindex="0" aria-label="Adapter log"></pre>
+        <p id="logMsg" class="muted small" aria-live="polite"></p>
+      </details>
+    </section>
+
+    <!-- About and privacy -->
+    <section class="card card-plain" id="card-about">
+      <h2 data-text="aboutTitle"></h2>
+      <div id="aboutText"></div>
+      <h2 data-text="privacyTitle"></h2>
+      <div id="privacyText"></div>
+      <p class="muted small" id="versionLine"></p>
+    </section>
+  </main>
+
+  <!-- Clear codes confirmation -->
+  <div id="clearModal" class="modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="clearTitle">
+      <h2 id="clearTitle"></h2>
+      <p id="clearIntro"></p>
+      <ul id="clearList" class="warn-list"></ul>
+      <p id="clearBefore" class="notice notice-info small"></p>
+      <label class="check">
+        <input id="clearSafety" type="checkbox">
+        <span id="clearSafetyText"></span>
+      </label>
+      <label for="clearInput" id="clearPrompt" class="field-label"></label>
+      <input id="clearInput" class="field" type="text" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" inputmode="text" placeholder="CLEAR">
+      <div class="btn-col">
+        <button id="clearConfirm" class="btn btn-danger" type="button" disabled></button>
+        <button id="clearCancel" class="btn btn-secondary" type="button"></button>
+      </div>
+    </div>
+  </div>
+
+  <noscript><p class="wrap">This page needs JavaScript turned on. It still never sends your data anywhere.</p></noscript>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

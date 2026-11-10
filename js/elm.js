@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.0.4';
+import { logger as defaultLogger } from './log.js?v=1.0.5';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -427,6 +427,29 @@ export class Elm327 {
     this.logger.log('info', 'Probing adapter...');
     for (var i = 0; i < cmds.length; i++) {
       out.push(await this.send(cmds[i], cmds[i] === '0100' ? { timeout: 10000 } : undefined));
+    }
+    // Addressing tests, 11-bit CAN only (protocol 6 or 8). They show whether this adapter and
+    // car accept requests to one module (ATSH) and reply filtering (ATCRA). Read-only requests.
+    var pn = '';
+    for (var k = 0; k < out.length; k++) {
+      if (out[k].cmd === 'ATDPN' && out[k].status === 'ok' && out[k].lines.length) pn = out[k].lines[0].trim().toUpperCase().replace(/^A/, '');
+    }
+    var last = out[out.length - 1];
+    if ((pn === '6' || pn === '8') && last && last.status === 'ok') {
+      this.logger.log('info', 'Addressing tests...');
+      var tests = ['ATSH 7E0', '0100', 'ATSH 7E2', '0100', 'ATSH 7DF', 'ATCRA 7E8', '0100', 'ATCRA 7EA', '0100'];
+      var lost = false;
+      for (var t = 0; t < tests.length && !lost; t++) {
+        var r = await this.send(tests[t]);
+        out.push(r);
+        if (r.status === 'stopped') lost = true;
+      }
+      if (!lost) {
+        // Always put the adapter back: all replies accepted, requests to all modules.
+        out.push(await this.send('ATAR'));
+        out.push(await this.send('ATSH 7DF'));
+        out.push(await this.send('0100'));
+      }
     }
     return out;
   }

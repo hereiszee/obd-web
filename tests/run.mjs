@@ -174,9 +174,12 @@ async function runE2E() {
     });
     await test('normal: probe', async () => {
       const res = await elm.probe();
-      assert.equal(res.length, 6);
-      assert.deepEqual(res.map((r) => r.cmd), ['ATI', 'AT@1', 'ATDP', 'ATDPN', 'ATRV', '0100']);
-      res.forEach((r) => assert.equal(r.status, 'ok', r.cmd + ' ' + r.status));
+      assert.deepEqual(res.slice(0, 6).map((r) => r.cmd), ['ATI', 'AT@1', 'ATDP', 'ATDPN', 'ATRV', '0100']);
+      res.slice(0, 6).forEach((r) => assert.equal(r.status, 'ok', r.cmd + ' ' + r.status));
+      // Addressing tests follow on CAN, and the adapter is put back to asking all modules.
+      assert.deepEqual(res.slice(-3).map((r) => r.cmd), ['ATAR', 'ATSH 7DF', '0100']);
+      res.slice(-3).forEach((r) => assert.equal(r.status, 'ok', r.cmd + ' ' + r.status));
+      assert.equal(res[res.length - 1].lines.length, 2, 'both modules answer again after the probe');
       assert.ok(/ELM327/.test(res[0].lines.join(' ')));
       assert.ok(/vLinker/.test(res[1].lines.join(' ')));
     });

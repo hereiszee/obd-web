@@ -11,7 +11,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>OBD Web</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M14 40a18 18 0 0 1 36 0' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M32 40l9-11' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='40' r='4' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="css/app.css?v=1.0.4">
+  <link rel="stylesheet" href="css/app.css?v=1.0.5">
 </head>
 <body>
   <header class="topbar">
@@ -130,6 +130,11 @@
         <summary>Choose readings</summary>
         <p class="muted small">Only readings this car supports are listed. Fewer readings update faster.</p>
         <div id="pickerList" class="picker-list"></div>
+        <p class="muted small">Speed. "Steady" asks for one reading at a time and holds the Bluetooth link better. "Fast" updates more often but can drop the link on some adapters. Change it while live data is stopped.</p>
+        <select id="liveMode" class="select">
+          <option value="steady">Steady (recommended)</option>
+          <option value="fast">Fast</option>
+        </select>
       </details>
       <div id="liveMsg" class="msg" hidden></div>
       <div id="tiles" class="tiles" aria-live="off"></div>
@@ -208,6 +213,6 @@
   </div>
 
   <noscript><p class="wrap">This page needs JavaScript turned on. It still never sends your data anywhere.</p></noscript>
-  <script type="module" src="js/app.js?v=1.0.4"></script>
+  <script type="module" src="js/app.js?v=1.0.5"></script>
 </body>
 </html>

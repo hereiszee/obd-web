@@ -228,6 +228,7 @@ export async function run() {
     const r0 = await elm.init();
     const obd = new Obd(elm);
     obd.protocolNumber = r0.protocolNumber;
+    obd.targetLive = true;
     await obd.supportedPids();
     const before = sent.length;
     const res = await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
@@ -262,6 +263,7 @@ export async function run() {
     const r0 = await elm.init();
     const obd = new Obd(elm);
     obd.protocolNumber = r0.protocolNumber;
+    obd.targetLive = true;
     await obd.supportedPids();
     return { obd, elm, sent };
   }
@@ -293,6 +295,34 @@ export async function run() {
     assert.ok(!sent.slice(mark).some((c) => /^ATSH/.test(c)), 'no more ATSH attempts');
     assert.ok(sent.slice(mark).includes('010C0D050F0411'));
     assert.equal(res.length, 6);
+  });
+
+  test('1.0.5: live data asks all modules by default (no ATSH)', async () => {
+    const { obd, sent } = await setup();
+    obd.targetLive = undefined;
+    const mark = sent.length;
+    await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
+    assert.ok(!sent.slice(mark).some((c) => /^ATSH/.test(c)), sent.slice(mark).join(' '));
+  });
+
+  test('1.0.5: steady mode sends one reading per request', async () => {
+    const { obd, sent } = await setup({ '010C': '7E804410C1E1A\r7EA04410C1E00\r\r>', '010D': '7E803410D00\r\r>' });
+    obd.targetLive = undefined;
+    obd.gentleLive = true;
+    const mark = sent.length;
+    const res = await obd.readPids([0x0C, 0x0D]);
+    assert.deepEqual(sent.slice(mark), ['010C', '010D']);
+    assert.equal(res[0].ecu, '7E8');
+    assert.equal(res[0].value, 0x1E1A / 4);
+  });
+
+  test('1.0.5: probe runs addressing tests and restores the adapter', async () => {
+    const { elm, sent } = await setup({ 'ATCRA7E8': 'OK\r\r>', 'ATCRA7EA': 'OK\r\r>', 'ATAR': 'OK\r\r>', 'ATI': 'ELM327 v2.2\r\r>', 'AT@1': 'OBDII to RS232 Interpreter\r\r>' });
+    const mark = sent.length;
+    await elm.probe();
+    const p = sent.slice(mark);
+    assert.ok(p.includes('ATSH7E0') && p.includes('ATCRA7E8'));
+    assert.deepEqual(p.slice(-3), ['ATAR', 'ATSH7DF', '0100']);
   });
 
   let passed = 0, failed = 0;

@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.4';
-import { describeDtc } from './dtc-db.js?v=1.0.4';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.5';
+import { describeDtc } from './dtc-db.js?v=1.0.5';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -630,7 +630,9 @@ export class Obd {
     let status = 'ok';
     let message = '';
     while (base <= 0xe0) {
-      const q = await this.query('01' + hex2(base));
+      let q = await this.query('01' + hex2(base));
+      // One retry on a timeout, so a brief stall does not leave half the readings missing.
+      if (q.status === 'timeout') q = await this.query('01' + hex2(base));
       if (q.status !== 'ok') {
         if (base === 0) { status = q.status; message = q.message; }
         break;
@@ -775,7 +777,9 @@ export class Obd {
   async readPids(pidList) {
     const pids = (pidList || []).map((p) => (typeof p === 'string' ? parseInt(p, 16) : p));
     let groups = null;
-    if (this.targetLive !== false && this._targetFails !== true) {
+    // Off unless switched on: a real Toyota C-HR answered NO DATA to every request addressed
+    // to one module (ATSH 7E0), so asking all modules is the safe default.
+    if (this.targetLive === true && this._targetFails !== true) {
       try { groups = await this._liveGroups(pids); } catch (e) { groups = null; }
     }
     if (!groups) return this._readPidsOn(pids, null);
@@ -808,7 +812,9 @@ export class Obd {
     const qopts = header ? { header } : undefined;
     const results = {};
     const can = await this.isCan();
-    const useMulti = can === true && this._multiPidOk !== false;
+    // gentleLive: one reading per request. Replies stay short (no multi-frame bursts), which
+    // held a BLE link better on a real car with four modules answering.
+    const useMulti = can === true && this._multiPidOk !== false && !this.gentleLive;
 
     if (useMulti) {
       for (let i = 0; i < pids.length; i += 6) {

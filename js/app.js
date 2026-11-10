@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.0.4';
-import { BleTransport } from './ble.js?v=1.0.4';
-import { SimTransport } from './sim.js?v=1.0.4';
-import { Elm327 } from './elm.js?v=1.0.4';
-import { Obd, ecuLabel } from './obd.js?v=1.0.4';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.4';
-import { describeDtc } from './dtc-db.js?v=1.0.4';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.4';
-import { buildReport } from './report.js?v=1.0.4';
+import { logger } from './log.js?v=1.0.5';
+import { BleTransport } from './ble.js?v=1.0.5';
+import { SimTransport } from './sim.js?v=1.0.5';
+import { Elm327 } from './elm.js?v=1.0.5';
+import { Obd, ecuLabel } from './obd.js?v=1.0.5';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.5';
+import { describeDtc } from './dtc-db.js?v=1.0.5';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.5';
+import { buildReport } from './report.js?v=1.0.5';
 
-var APP_VERSION = '1.0.4';
+var APP_VERSION = '1.0.5';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -629,7 +629,9 @@ function onProbe() {
 function probeLabel(cmd) {
   var m = {
     ATI: 'Chip version', 'AT@1': 'Adapter description', ATDP: 'Protocol', ATDPN: 'Protocol number',
-    ATRV: 'Battery voltage', '0100': 'Car answer test'
+    ATRV: 'Battery voltage', '0100': 'Car answer test',
+    ATSH7E0: 'Ask engine module only', ATSH7E2: 'Ask hybrid module only', ATSH7DF: 'Ask all modules',
+    ATCRA7E8: 'Listen to engine only', ATCRA7EA: 'Listen to hybrid module only', ATAR: 'Listen to all modules'
   };
   return m[String(cmd).toUpperCase().replace(/\s/g, '')] || 'Reply';
 }
@@ -1198,6 +1200,9 @@ function onLiveToggle() {
   if (S.live.promise) return;
   if (!S.connected || S.busy || !S.live.selected.length) return;
   var gen = ++S.live.gen;
+  var lm = $('liveMode');
+  if (S.obd) S.obd.gentleLive = !lm || lm.value !== 'fast';
+  logger.log('info', 'Live mode: ' + (S.obd && S.obd.gentleLive ? 'steady (one reading per request)' : 'fast (several readings per request)'));
   S.live.running = true;
   S.live.error = null;
   logger.log('info', '== Live data started');

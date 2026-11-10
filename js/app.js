@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.0.3';
-import { BleTransport } from './ble.js?v=1.0.3';
-import { SimTransport } from './sim.js?v=1.0.3';
-import { Elm327 } from './elm.js?v=1.0.3';
-import { Obd, ecuLabel } from './obd.js?v=1.0.3';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.3';
-import { describeDtc } from './dtc-db.js?v=1.0.3';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.3';
-import { buildReport } from './report.js?v=1.0.3';
+import { logger } from './log.js?v=1.0.4';
+import { BleTransport } from './ble.js?v=1.0.4';
+import { SimTransport } from './sim.js?v=1.0.4';
+import { Elm327 } from './elm.js?v=1.0.4';
+import { Obd, ecuLabel } from './obd.js?v=1.0.4';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.4';
+import { describeDtc } from './dtc-db.js?v=1.0.4';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.4';
+import { buildReport } from './report.js?v=1.0.4';
 
-var APP_VERSION = '1.0.3';
+var APP_VERSION = '1.0.4';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -232,6 +232,7 @@ function updateButtons() {
   setDisabled('btnSim', hasT || S.busy);
   setDisabled('simScenario', hasT || S.busy);
   setDisabled('bleChannel', hasT || S.busy);
+  setDisabled('bleWrite', hasT || S.busy);
   setDisabled('btnDisconnect', !hasT);
   setDisabled('btnProbe', !hasT || S.busy || live);
   show($('btnRetry'), S.adapterOnly && hasT);
@@ -314,7 +315,8 @@ function onConnectBle() {
   var t, p;
   try {
     var ch = $('bleChannel');
-    t = new BleTransport({ logger: logger, prefer: ch ? ch.value : 'auto' });
+    var wm = $('bleWrite');
+    t = new BleTransport({ logger: logger, prefer: ch ? ch.value : 'auto', writeMode: wm ? wm.value : 'auto' });
     p = t.connect();
   } catch (e) {
     p = Promise.reject(e);
@@ -487,7 +489,7 @@ function onTransportLost(t, reason) {
   }
 }
 
-var RECONNECT_DELAYS = [700, 1500, 3000, 5000];
+var RECONNECT_DELAYS = [700, 1500, 2500, 4000, 6000, 8000];
 
 // After an unexpected Bluetooth drop: reconnect to the same adapter, set it up again and
 // carry on (including live data) without the user doing anything.
@@ -533,7 +535,13 @@ function autoReconnect(t, wasLive, reason) {
           if (aborted()) return 'aborted';
           S.elm = new Elm327(t, logger);
           S.obd = new Obd(S.elm);
-          return talkToCar().then(function () { return 'done'; });
+          return talkToCar().then(function () {
+            if (aborted()) return 'aborted';
+            // The link can drop again while the adapter is being set up. That drop was
+            // ignored because we were reconnecting, so treat it as a failed try.
+            if (!t.isConnected()) throw new Error('The link dropped again during setup');
+            return 'done';
+          });
         });
       }).then(function (res) {
         S.busy = false;
@@ -601,7 +609,7 @@ function onProbe() {
   show(out, true);
   out.appendChild(h('p', { class: 'muted small', text: 'Asking the adapter about itself...' }));
   run('Probing the adapter', function () {
-    return S.elm.probe().then(function (results) {
+    return Promise.resolve(S.obd ? S.obd.resetHeader() : true).then(function () { return S.elm.probe(); }).then(function (results) {
       clear(out);
       out.appendChild(h('h3', { text: 'Probe results' }));
       var table = h('table', { class: 'table' });
@@ -1177,7 +1185,8 @@ function liveLoop(gen) {
         lastRate = now;
       }
       // Yield so the page stays responsive.
-      return delay(S.kind === 'sim' ? 120 : 0);
+      // A short pause between rounds gives a BLE adapter time to breathe.
+      return delay(S.kind === 'sim' ? 120 : 40);
     }).then(cycle);
   }
   return cycle();
@@ -1197,6 +1206,11 @@ function onLiveToggle() {
   var p = liveLoop(gen).catch(function (e) {
     logger.log('error', 'Live loop stopped: ' + ((e && e.stack) || e));
     if (S.live.gen === gen) S.live.error = friendlyError(e);
+  }).then(function () {
+    // Point the adapter back at all modules before other tools run.
+    if (S.obd && S.transport && (!S.transport.isConnected || S.transport.isConnected())) {
+      return S.obd.resetHeader().catch(function () {});
+    }
   }).then(function () {
     if (S.live.promise === p) {
       S.live.running = false;

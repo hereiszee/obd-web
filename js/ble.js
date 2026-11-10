@@ -1,7 +1,7 @@
 // BleTransport: talks to a BLE ELM327 adapter (for example Vgate vLinker MC+) over Web Bluetooth.
 // Connection happens entirely in this page. No pairing in phone settings is needed.
 
-import { logger as defaultLogger } from './log.js?v=1.0.3';
+import { logger as defaultLogger } from './log.js?v=1.0.4';
 
 function uuid16(n) {
   var h = n.toString(16);
@@ -90,6 +90,26 @@ function shortUuid(u) {
   return m ? m[1] : u;
 }
 
+// Bluefy sometimes never settles a GATT promise when the link drops mid-call. Give every
+// setup step a deadline so a reconnect attempt can fail and the next one can start.
+function withTimeout(p, ms, what) {
+  return new Promise(function (resolve, reject) {
+    var done = false;
+    var t = setTimeout(function () {
+      if (done) return;
+      done = true;
+      reject(new Error(what + ' took longer than ' + Math.round(ms / 1000) + ' s'));
+    }, ms);
+    Promise.resolve(p).then(function (v) {
+      if (done) return;
+      done = true; clearTimeout(t); resolve(v);
+    }, function (e) {
+      if (done) return;
+      done = true; clearTimeout(t); reject(e);
+    });
+  });
+}
+
 function errText(e) {
   if (e === null || e === undefined) return 'unknown error';
   if (typeof e !== 'object') return 'code ' + String(e);
@@ -105,6 +125,7 @@ export class BleTransport {
     this.info = { deviceName: null, serviceUuid: null, writeUuid: null, notifyUuid: null, allServices: [] };
     this._logger = opts.logger || defaultLogger;
     this._prefer = opts.prefer || 'auto';   // 'auto' | 'e781' | '18f0'
+    this._forceWrite = opts.writeMode === 'withResponse' ? 'withResponse' : null;
     this._device = null;
     this._server = null;
     this._notifyChar = null;
@@ -223,7 +244,7 @@ export class BleTransport {
     var lastErr = null;
     for (var attempt = 1; attempt <= 3 && !server; attempt++) {
       try {
-        server = await device.gatt.connect();
+        server = await withTimeout(device.gatt.connect(), 10000, 'Bluetooth connect');
       } catch (e) {
         lastErr = e;
         this._logger.log('warn', 'GATT connect attempt ' + attempt + ' failed: ' + errText(e));
@@ -231,12 +252,17 @@ export class BleTransport {
       }
     }
     if (!server) throw lastErr || new Error('GATT connect failed');
+    if (this._userDisconnect) {
+      // The user tapped Disconnect while we were connecting. Do not leave a link nobody owns.
+      try { device.gatt.disconnect(); } catch (e) { /* ignore */ }
+      throw new Error('Connection cancelled');
+    }
     this._server = server;
     this._logger.log('info', 'GATT connected. Discovering services...');
 
     var services = [];
     try {
-      services = await server.getPrimaryServices();
+      services = await withTimeout(server.getPrimaryServices(), 6000, 'Listing services');
     } catch (e) {
       this._logger.log('warn', 'getPrimaryServices() failed (' + errText(e) + '). Trying known services one by one.');
       services = [];
@@ -245,7 +271,8 @@ export class BleTransport {
       services = [];
       for (var i = 0; i < CANDIDATE_SERVICES.length; i++) {
         try {
-          services.push(await server.getPrimaryService(CANDIDATE_SERVICES[i]));
+          if (!server.connected) break;
+          services.push(await withTimeout(server.getPrimaryService(CANDIDATE_SERVICES[i]), 3000, 'Opening a service'));
         } catch (e) { /* not present */ }
       }
     }
@@ -271,7 +298,7 @@ export class BleTransport {
       self._logger.log('info', 'Service ' + shortUuid(svcUuid));
       var list;
       try {
-        list = await svcByUuid[svcUuid].getCharacteristics();
+        list = await withTimeout(svcByUuid[svcUuid].getCharacteristics(), 6000, 'Listing characteristics');
       } catch (e) {
         self._logger.log('warn', '  could not list characteristics: ' + errText(e));
         return false;
@@ -329,12 +356,19 @@ export class BleTransport {
     if (wp.writeWithoutResponse && typeof this._writeChar.writeValueWithoutResponse === 'function') this._writeMode = 'withoutResponse';
     else if (typeof this._writeChar.writeValueWithResponse === 'function' && wp.write) this._writeMode = 'withResponse';
     else this._writeMode = 'legacy';
+    if (this._forceWrite && wp.write && typeof this._writeChar.writeValueWithResponse === 'function') {
+      this._writeMode = 'withResponse';
+    }
     this._logger.log('info', 'Using notify ' + pick.notify.uuid + ' and write ' + pick.write.uuid +
       ' in service ' + pick.write.service + ' (' + pick.reason + ', write mode ' + this._writeMode + ')');
 
     this._notifyChar.addEventListener('characteristicvaluechanged', this._onNotify);
-    await this._notifyChar.startNotifications();
+    await withTimeout(this._notifyChar.startNotifications(), 6000, 'Starting notifications');
     this._logger.log('info', 'Notifications started.');
+    if (this._userDisconnect) {
+      try { device.gatt.disconnect(); } catch (e) { /* ignore */ }
+      throw new Error('Connection cancelled');
+    }
     this._connected = true;
   }
 

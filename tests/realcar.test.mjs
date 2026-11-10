@@ -25,6 +25,9 @@ const REPLIES = {
   '020000': '7EB0742000058188003\r7E8074200007E1F8803\r7EA07420000581A8003\r7EE07420000581A8003\r\r>',
   '0101': '7EE06410100040000\r7EB06410100040000\r7E80641010007A100\r7EA06410100040000\r\r>',
   '01A6': '7EA0641A600219513\r\r>',
+  // Third session: live data addressed to the engine only (ATSH 7E0), replies from 7E8.
+  'ATSH7E0': 'OK\r\r>', 'ATSH7DF': 'OK\r\r>', 'ATSH7E2': 'OK\r\r>', 'ATSH7E3': 'OK\r\r>', 'ATSH7E6': 'OK\r\r>',
+  '010C0D050F0411': '7E8100E410C00000D00\r7E821057A0F49040011\r7E8222E000000000000\r\r>',
 };
 
 // Replays the captured replies in small fragments, like BLE notifications.
@@ -214,6 +217,82 @@ export async function run() {
     assert.ok(used.every((m) => m.complete), 'all supported monitors complete');
     const od = await obd.readPid(0xA6);
     assert.equal(Math.round(od.value * 10), 2200851);
+  });
+
+  test('real car: live data goes to one module, later reads go back to all', async () => {
+    const tr = new ReplayTransport();
+    const sent = [];
+    const w = tr.write.bind(tr);
+    tr.write = (x) => { sent.push(x.trim().replace(/\s+/g, '')); return w(x); };
+    const elm = new Elm327(tr, new Logger());
+    const r0 = await elm.init();
+    const obd = new Obd(elm);
+    obd.protocolNumber = r0.protocolNumber;
+    await obd.supportedPids();
+    const before = sent.length;
+    const res = await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
+    const live = sent.slice(before);
+    assert.deepEqual(live.slice(0, 2), ['ATSH7E0', '010C0D050F0411']);
+    const rpm = res.find((r) => r.pid === 0x0C);
+    assert.equal(rpm.status, 'ok');
+    assert.equal(rpm.ecu, '7E8');
+    assert.equal(rpm.value, 0);
+    const cool = res.find((r) => r.pid === 0x05);
+    assert.equal(cool.value, 0x7A - 40);
+    const mark = sent.length;
+    await obd.query('0101');
+    assert.deepEqual(sent.slice(mark, mark + 2), ['ATSH7DF', '0101'], 'broadcast restored');
+  });
+
+  async function setup(overrides) {
+    const tr = new ReplayTransport();
+    const sent = [];
+    const w = tr.write.bind(tr);
+    tr.write = (x) => {
+      const c = x.trim().replace(/\s+/g, '');
+      sent.push(c);
+      if (overrides && overrides[c] !== undefined) {
+        const r = overrides[c];
+        setTimeout(() => tr.onData && tr.onData(r), 2);
+        return Promise.resolve();
+      }
+      return w(x);
+    };
+    const elm = new Elm327(tr, new Logger());
+    const r0 = await elm.init();
+    const obd = new Obd(elm);
+    obd.protocolNumber = r0.protocolNumber;
+    await obd.supportedPids();
+    return { obd, elm, sent };
+  }
+
+  test('review: failed switch back to all modules blocks clear codes', async () => {
+    const { obd, sent } = await setup({ 'ATSH7DF': '?\r\r>' });
+    await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
+    const mark = sent.length;
+    const r = await obd.clearDtcs();
+    assert.equal(r.ok, false);
+    assert.ok(!sent.slice(mark).includes('04'), '04 must not be sent while still addressed to one module');
+  });
+
+  test('review: single readings stay addressed to their module', async () => {
+    const { obd, sent } = await setup();
+    const mark = sent.length;
+    await obd.readPids([0x0C, 0x5B]);
+    await obd.readPids([0x0C, 0x5B]);
+    const live = sent.slice(mark);
+    assert.ok(!live.includes('ATSH7DF'), 'no switch back to broadcast inside live rounds: ' + live.join(' '));
+    assert.ok(live.some((c) => /^ATSH7E/.test(c)));
+  });
+
+  test('review: adapter that refuses ATSH falls back to asking all modules', async () => {
+    const { obd, sent } = await setup({ 'ATSH7E0': '?\r\r>', 'ATSH7E2': '?\r\r>', 'ATSH7E3': '?\r\r>', 'ATSH7E6': '?\r\r>' });
+    await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
+    const mark = sent.length;
+    const res = await obd.readPids([0x0C, 0x0D, 0x05, 0x0F, 0x04, 0x11]);
+    assert.ok(!sent.slice(mark).some((c) => /^ATSH/.test(c)), 'no more ATSH attempts');
+    assert.ok(sent.slice(mark).includes('010C0D050F0411'));
+    assert.equal(res.length, 6);
   });
 
   let passed = 0, failed = 0;

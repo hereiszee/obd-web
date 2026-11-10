@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.3';
-import { describeDtc } from './dtc-db.js?v=1.0.3';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.4';
+import { describeDtc } from './dtc-db.js?v=1.0.4';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -534,6 +534,30 @@ export class Obd {
     this.supported = null;      // cache from supportedPids()
     this._multiPidOk = null;    // null unknown, true works, false do not use
     this._multiPidFails = 0;
+    this._header = null;        // last ATSH we sent (null = adapter default, broadcast 7DF)
+  }
+
+  // True on 11-bit CAN, where each module can be addressed directly (7E0 to 7E7).
+  async _canTarget() {
+    const p = normalizeProtocol(await this._protocol());
+    return p === '6' || p === '8';
+  }
+
+  // Sets the CAN request header. Returns false if the adapter refused it.
+  async _setHeader(h) {
+    if (this._header === h) return true;
+    const r = await this.elm.send('ATSH ' + h);
+    if (r && r.status === 'ok') { this._header = h; return true; }
+    // We no longer know which header the adapter has (the reply may just have been lost).
+    // 'unknown' makes the next broadcast query send ATSH 7DF again.
+    this._header = 'unknown';
+    return false;
+  }
+
+  // Points the adapter back at all modules (7DF) if live data left it on one module.
+  async resetHeader() {
+    if (this._header === null || this._header === '7DF') return true;
+    return this._setHeader('7DF');
   }
 
   async _protocol() {
@@ -557,9 +581,22 @@ export class Obd {
   async query(cmdHex, opts) {
     const cmd = String(cmdHex).replace(/\s+/g, '').toUpperCase();
     const proto = await this._protocol();
+    // Live data may have pointed the adapter at one module. Everything else asks all modules.
+    const wantHeader = opts && opts.header ? opts.header : null;
+    if (wantHeader) {
+      if (!(await this._setHeader(wantHeader))) {
+        return { status: 'error', message: 'The adapter refused to address one module.', responses: [], negative: [] };
+      }
+    } else if (this._header !== null && this._header !== '7DF') {
+      // Never send a broadcast request (especially 04 clear codes) while the adapter may still
+      // be pointed at one module. Try twice, then refuse.
+      if (!(await this._setHeader('7DF')) && !(await this._setHeader('7DF'))) {
+        return { status: 'error', message: 'The adapter did not switch back to asking all modules. Disconnect, connect again, then retry.', responses: [], negative: [] };
+      }
+    }
     let r;
     try {
-      r = await this.elm.send(cmd, opts);
+      r = await this.elm.send(cmd, opts && opts.timeout ? { timeout: opts.timeout } : undefined);
     } catch (e) {
       return { status: 'error', message: 'The adapter did not respond properly. ' + (e && e.message ? e.message : ''), responses: [], negative: [] };
     }
@@ -701,9 +738,9 @@ export class Obd {
     return out;
   }
 
-  async readPid(pid) {
+  async readPid(pid, opts) {
     const p = typeof pid === 'string' ? parseInt(pid, 16) : pid;
-    const q = await this.query('01' + hex2(p));
+    const q = await this.query('01' + hex2(p), opts);
     if (q.status !== 'ok') {
       const ns = q.status === 'nodata' || q.status === 'unsupported';
       return { pid: p, ecu: null, value: null, unit: '', text: ns ? NOT_SUPPORTED : '', status: q.status, message: ns ? NOT_SUPPORTED : q.message };
@@ -714,8 +751,61 @@ export class Obd {
     return { pid: p, ecu: m.ecu, value: d.value, unit: d.unit || '', text: d.text, status: 'ok', message: '' };
   }
 
+  // Picks the module to ask for each PID: the engine (7E8) when it has it, otherwise the
+  // first module that said it supports it. Returns [{ecu, header, pids}] or null when the
+  // car or adapter cannot be addressed per module.
+  async _liveGroups(pids) {
+    if (!(await this._canTarget())) return null;
+    const by = this.supported && this.supported.byEcu;
+    if (!by) return null;
+    const ecus = Object.keys(by).filter((e) => /^7E[89A-F]$/.test(e)).sort((a, b) => (a === '7E8' ? -1 : b === '7E8' ? 1 : a < b ? -1 : a > b ? 1 : 0));
+    if (!ecus.length) return null;
+    const groups = {};
+    const order = [];
+    pids.forEach((p) => {
+      const ecu = ecus.find((e) => by[e] && by[e].has && by[e].has(p)) || ecus[0];
+      if (!groups[ecu]) { groups[ecu] = []; order.push(ecu); }
+      groups[ecu].push(p);
+    });
+    return order.map((ecu) => ({ ecu, header: (parseInt(ecu, 16) - 8).toString(16).toUpperCase(), pids: groups[ecu] }));
+  }
+
+  // Live data. On 11-bit CAN each request goes to one module, so only that module answers.
+  // On a car with several modules this cuts the reply traffic a lot, which matters on BLE.
   async readPids(pidList) {
     const pids = (pidList || []).map((p) => (typeof p === 'string' ? parseInt(p, 16) : p));
+    let groups = null;
+    if (this.targetLive !== false && this._targetFails !== true) {
+      try { groups = await this._liveGroups(pids); } catch (e) { groups = null; }
+    }
+    if (!groups) return this._readPidsOn(pids, null);
+    const results = {};
+    for (let g = 0; g < groups.length; g++) {
+      const part = await this._readPidsOn(groups[g].pids, groups[g].header);
+      part.forEach((r) => { results[r.pid] = r; });
+    }
+    // If addressing modules gave nothing at all, fall back to asking everyone for good.
+    const any = pids.some((p) => results[p] && results[p].status === 'ok');
+    // Only a clear "this module does not have it" counts against targeting. Timeouts and
+    // dropped links say nothing about addressing.
+    const allNo = pids.every((p) => results[p] && (results[p].status === 'nodata' || results[p].status === 'unsupported'));
+    if (!any && allNo) {
+      this._targetMisses = (this._targetMisses || 0) + 1;
+      if (this._targetMisses >= 3) this._targetFails = true;
+      return this._readPidsOn(pids, null);
+    }
+    this._targetMisses = 0;
+    return pids.map((p) => results[p]);
+  }
+
+  async _readPidsOn(pidList, header) {
+    const pids = pidList;
+    if (header && !(await this._setHeader(header))) {
+      // This adapter does not accept ATSH. Stop addressing modules and ask everyone.
+      this._targetFails = true;
+      return this._readPidsOn(pids, null);
+    }
+    const qopts = header ? { header } : undefined;
     const results = {};
     const can = await this.isCan();
     const useMulti = can === true && this._multiPidOk !== false;
@@ -724,10 +814,10 @@ export class Obd {
       for (let i = 0; i < pids.length; i += 6) {
         const chunk = pids.slice(i, i + 6);
         if (chunk.length === 1 || chunk.some((p) => !pidByteLength(p))) {
-          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j]);
+          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j], qopts);
           continue;
         }
-        const q = await this.query('01' + chunk.map(hex2).join(''));
+        const q = await this.query('01' + chunk.map(hex2).join(''), qopts);
         let got = 0;
         if (q.status === 'ok') {
           sortByEcu(q.responses).forEach((m) => {
@@ -753,11 +843,11 @@ export class Obd {
             this._multiPidFails++;
             if (this._multiPidOk !== true || this._multiPidFails >= 3) this._multiPidOk = false;
           }
-          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j]);
+          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j], qopts);
         }
       }
     } else {
-      for (let j = 0; j < pids.length; j++) results[pids[j]] = await this.readPid(pids[j]);
+      for (let j = 0; j < pids.length; j++) results[pids[j]] = await this.readPid(pids[j], qopts);
     }
     return pids.map((p) => results[p]);
   }

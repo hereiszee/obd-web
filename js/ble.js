@@ -1,7 +1,7 @@
 // BleTransport: talks to a BLE ELM327 adapter (for example Vgate vLinker MC+) over Web Bluetooth.
 // Connection happens entirely in this page. No pairing in phone settings is needed.
 
-import { logger as defaultLogger } from './log.js?v=1.0.2';
+import { logger as defaultLogger } from './log.js?v=1.0.3';
 
 function uuid16(n) {
   var h = n.toString(16);
@@ -104,6 +104,7 @@ export class BleTransport {
     this.onDisconnect = null;
     this.info = { deviceName: null, serviceUuid: null, writeUuid: null, notifyUuid: null, allServices: [] };
     this._logger = opts.logger || defaultLogger;
+    this._prefer = opts.prefer || 'auto';   // 'auto' | 'e781' | '18f0'
     this._device = null;
     this._server = null;
     this._notifyChar = null;
@@ -288,11 +289,17 @@ export class BleTransport {
 
     // Fast path: open only the known adapter services, in order of preference, and stop at the
     // first usable pair. Listing every service is slow and the vLinker can drop the link meanwhile.
+    var pairs = KNOWN_PAIRS.slice();
+    var want = this._prefer === '18f0' ? uuid16(0x18f0) : this._prefer === 'e781' ? 'e7810a71-73ae-499d-8c15-faa9aef0c3f2' : null;
+    if (want) {
+      pairs.sort(function (a, b) { return (a.service === want ? 0 : 1) - (b.service === want ? 0 : 1); });
+      this._logger.log('info', 'Preferred Bluetooth channel: ' + shortUuid(want));
+    }
     var pick = null;
-    for (var k = 0; k < KNOWN_PAIRS.length && !pick; k++) {
-      if (!svcByUuid[KNOWN_PAIRS[k].service]) continue;
-      await listService(KNOWN_PAIRS[k].service);
-      pick = this._choose(chars);
+    for (var k = 0; k < pairs.length && !pick; k++) {
+      if (!svcByUuid[pairs[k].service]) continue;
+      await listService(pairs[k].service);
+      pick = this._choose(chars, pairs);
     }
     // Slow path: list everything else and pick the best match.
     if (!pick) {
@@ -331,7 +338,7 @@ export class BleTransport {
     this._connected = true;
   }
 
-  _choose(chars) {
+  _choose(chars, pairsInOrder) {
     function find(service, uuid) {
       for (var i = 0; i < chars.length; i++) {
         if (chars[i].service === service && chars[i].uuid === uuid) return chars[i];
@@ -339,8 +346,9 @@ export class BleTransport {
       return null;
     }
     // 1. Known pairs.
-    for (var k = 0; k < KNOWN_PAIRS.length; k++) {
-      var kp = KNOWN_PAIRS[k];
+    var kps = pairsInOrder || KNOWN_PAIRS;
+    for (var k = 0; k < kps.length; k++) {
+      var kp = kps[k];
       var n = find(kp.service, kp.notify);
       var w = find(kp.service, kp.write);
       if (n && w && canNotify(n) && canWrite(w)) return { notify: n, write: w, reason: 'known pair' };

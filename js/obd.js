@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.2';
-import { describeDtc } from './dtc-db.js?v=1.0.2';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.3';
+import { describeDtc } from './dtc-db.js?v=1.0.3';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -769,6 +769,12 @@ export class Obd {
     if (q.status === 'ok') {
       const m = sortByEcu(q.responses.filter((x) => x.bytes[1] === 0x02 && x.bytes.length >= 5))[0];
       if (m && (m.bytes[3] || m.bytes[4])) dtc = decodeDtc(m.bytes[3], m.bytes[4]);
+      // Every module answered "no code stored a freeze frame" (00 00). Stop here instead of
+      // asking for readings that cannot exist. Slow NO DATA replies also strain BLE links.
+      const answers = q.responses.filter((x) => x.bytes[1] === 0x02 && x.bytes.length >= 5);
+      if (!dtc && answers.length && answers.every((x) => !x.bytes[3] && !x.bytes[4])) {
+        return { dtc: null, values: [], status: 'nodata', message: 'No freeze frame is saved. The car saves one only when a fault turns on the check engine light, and right now no module has one.' };
+      }
     }
 
     // Which PIDs are stored in frame 0

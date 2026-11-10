@@ -11,7 +11,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>OBD Web</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M14 40a18 18 0 0 1 36 0' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M32 40l9-11' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='40' r='4' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="css/app.css?v=1.0.2">
+  <link rel="stylesheet" href="css/app.css?v=1.0.3">
 </head>
 <body>
   <header class="topbar">
@@ -59,6 +59,15 @@
         </div>
       </div>
       <div id="probeOut" class="out" hidden></div>
+      <details class="picker" id="bleAdvanced">
+        <summary>Bluetooth channel (advanced)</summary>
+        <p class="muted small">Some adapters offer more than one Bluetooth channel. If the connection keeps dropping, pick the other one, then tap Connect adapter again.</p>
+        <select id="bleChannel" class="select">
+          <option value="auto">Automatic (recommended)</option>
+          <option value="e781">iOS channel (E7810A71)</option>
+          <option value="18f0">Main channel (18F0)</option>
+        </select>
+      </details>
       <div data-explain="connect"></div>
     </section>
 
@@ -83,24 +92,30 @@
         <button id="btnRead" class="btn btn-primary" type="button">Read codes</button>
         <button id="btnClear" class="btn btn-danger" type="button">Clear codes</button>
       </div>
-      <button id="btnReadiness" class="btn btn-ghost btn-block" type="button">Check readiness monitors</button>
       <div id="codesOut" class="out"></div>
-      <div id="readinessOut" class="out"></div>
       <div data-explain="codes"></div>
     </section>
 
-    <!-- 4. Freeze frame -->
+    <!-- 4. Readiness monitors -->
+    <section class="card" id="card-readiness" aria-labelledby="h-readiness">
+      <h2 id="h-readiness"><span class="step">4</span> Readiness monitors</h2>
+      <p class="lead" data-lead="readiness"></p>
+      <button id="btnReadiness" class="btn btn-primary btn-block" type="button">Check readiness monitors</button>
+      <div id="readinessOut" class="out"></div>
+    </section>
+
+    <!-- 5. Freeze frame -->
     <section class="card" id="card-freeze" aria-labelledby="h-freeze">
-      <h2 id="h-freeze"><span class="step">4</span> Freeze frame</h2>
+      <h2 id="h-freeze"><span class="step">5</span> Freeze frame</h2>
       <p class="lead" data-lead="freeze"></p>
       <button id="btnFreeze" class="btn btn-primary btn-block" type="button">Read freeze frame</button>
       <div id="freezeOut" class="out"></div>
       <div data-explain="freeze"></div>
     </section>
 
-    <!-- 5. Live data -->
+    <!-- 6. Live data -->
     <section class="card" id="card-live" aria-labelledby="h-live">
-      <h2 id="h-live"><span class="step">5</span> Live data</h2>
+      <h2 id="h-live"><span class="step">6</span> Live data</h2>
       <p class="lead" data-lead="live"></p>
       <div class="btn-row">
         <button id="btnLive" class="btn btn-primary" type="button">Start live data</button>
@@ -117,9 +132,9 @@
       <div data-explain="live"></div>
     </section>
 
-    <!-- 6. Report -->
+    <!-- 7. Report -->
     <section class="card" id="card-report" aria-labelledby="h-report">
-      <h2 id="h-report"><span class="step">6</span> Report</h2>
+      <h2 id="h-report"><span class="step">7</span> Report</h2>
       <p class="lead" data-lead="report"></p>
       <label class="check">
         <input id="includeVin" type="checkbox">
@@ -188,6 +203,6 @@
   </div>
 
   <noscript><p class="wrap">This page needs JavaScript turned on. It still never sends your data anywhere.</p></noscript>
-  <script type="module" src="js/app.js?v=1.0.2"></script>
+  <script type="module" src="js/app.js?v=1.0.3"></script>
 </body>
 </html>

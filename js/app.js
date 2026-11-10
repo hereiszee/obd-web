@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.0.2';
-import { BleTransport } from './ble.js?v=1.0.2';
-import { SimTransport } from './sim.js?v=1.0.2';
-import { Elm327 } from './elm.js?v=1.0.2';
-import { Obd, ecuLabel } from './obd.js?v=1.0.2';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.2';
-import { describeDtc } from './dtc-db.js?v=1.0.2';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.2';
-import { buildReport } from './report.js?v=1.0.2';
+import { logger } from './log.js?v=1.0.3';
+import { BleTransport } from './ble.js?v=1.0.3';
+import { SimTransport } from './sim.js?v=1.0.3';
+import { Elm327 } from './elm.js?v=1.0.3';
+import { Obd, ecuLabel } from './obd.js?v=1.0.3';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.3';
+import { describeDtc } from './dtc-db.js?v=1.0.3';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.3';
+import { buildReport } from './report.js?v=1.0.3';
 
-var APP_VERSION = '1.0.2';
+var APP_VERSION = '1.0.3';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -231,6 +231,7 @@ function updateButtons() {
   setDisabled('btnConnect', hasT || S.busy);
   setDisabled('btnSim', hasT || S.busy);
   setDisabled('simScenario', hasT || S.busy);
+  setDisabled('bleChannel', hasT || S.busy);
   setDisabled('btnDisconnect', !hasT);
   setDisabled('btnProbe', !hasT || S.busy || live);
   show($('btnRetry'), S.adapterOnly && hasT);
@@ -312,7 +313,8 @@ function onConnectBle() {
   // so the browser accepts it as a user gesture and shows the device list.
   var t, p;
   try {
-    t = new BleTransport({ logger: logger });
+    var ch = $('bleChannel');
+    t = new BleTransport({ logger: logger, prefer: ch ? ch.value : 'auto' });
     p = t.connect();
   } catch (e) {
     p = Promise.reject(e);
@@ -407,8 +409,10 @@ function talkToCar() {
         var sim = S.kind === 'sim' ? ' (simulated car)' : '';
         setStatus('ok', 'Connected to the car' + sim + '. Everything below is ready to use.', S.kind === 'sim' ? 'Simulated car' : 'Connected');
         setMsg($('connectMsg'), 'ok', null, 'Next: run the Used car check, or read the trouble codes.');
-        if (!S.reconnecting) setupLive();
-        if (S.kind === 'ble') { keepAwake(true); if (S.elm) S.elm.startKeepAlive(4000); }
+        // Build the live readings list on first success, including when the very first
+        // connection dropped and this is an automatic reconnect.
+        if (!S.reconnecting || !S.live.selected.length) setupLive();
+        if (S.kind === 'ble') { keepAwake(true); if (S.elm) S.elm.startKeepAlive(1500); }
       });
   });
 }
@@ -540,6 +544,7 @@ function autoReconnect(t, wasLive, reason) {
         var avail = supportedLivePids();
         var sel = keepSel.filter(function (p) { return avail.indexOf(p) >= 0; });
         if (sel.length) { S.live.selected = sel; renderPicker(avail); renderTiles(); }
+        else if (!S.live.selected.length) setupLive();
         setMsg($('connectMsg'), 'ok', 'Reconnected', 'The Bluetooth link dropped for a moment and the app reconnected by itself.' + (wasLive ? ' Live data has restarted.' : ''));
         updateButtons();
         if (wasLive) onLiveToggle();

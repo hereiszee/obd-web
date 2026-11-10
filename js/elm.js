@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.0.2';
+import { logger as defaultLogger } from './log.js?v=1.0.3';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -315,7 +315,7 @@ export class Elm327 {
       if (!t || (t.isConnected && !t.isConnected())) return;
       if (self.idleMs() < ms) return;
       self.send('ATRV', { timeout: 2000 });
-    }, 1000);
+    }, 500);
   }
 
   stopKeepAlive() {

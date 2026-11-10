@@ -20,6 +20,11 @@ const REPLIES = {
   '0160': '7EA06416008000001\r7EB06416000000001\r7E806416060800041\r7EE06416008000001\r\r>',
   '0180': '7EA06418002000041\r7EB06418000000040\r7E80641800204000C\r7EE06418000000040\r\r>',
   '01A0': '7EA0641A004000000\r\r>',
+  // Second session (no stored codes): every module says no freeze frame.
+  '020200': '7E8054202000000\r7EA054202000000\r7EE054202000000\r7EB054202000000\r\r>',
+  '020000': '7EB0742000058188003\r7E8074200007E1F8803\r7EA07420000581A8003\r7EE07420000581A8003\r\r>',
+  '0101': '7EE06410100040000\r7EB06410100040000\r7E80641010007A100\r7EA06410100040000\r\r>',
+  '01A6': '7EA0641A600219513\r\r>',
 };
 
 // Replays the captured replies in small fragments, like BLE notifications.
@@ -179,6 +184,36 @@ export async function run() {
     await new Promise((r) => setTimeout(r, 1500));
     assert.ok(n >= 1, 'expected a keepalive ATRV');
     assert.equal(sent.filter((c) => c === 'ATRV').length, n, 'no keepalive after stop');
+  });
+
+  test('real car: freeze frame stops after 020200 says no frame is stored', async () => {
+    const tr = new ReplayTransport();
+    const sent = [];
+    const w = tr.write.bind(tr);
+    tr.write = (x) => { sent.push(x.trim()); return w(x); };
+    const elm = new Elm327(tr, new Logger());
+    const r0 = await elm.init();
+    const obd = new Obd(elm);
+    obd.protocolNumber = r0.protocolNumber;
+    const before = sent.length;
+    const ff = await obd.freezeFrame();
+    assert.deepEqual(sent.slice(before), ['020200'], 'only one request expected');
+    assert.equal(ff.status, 'nodata');
+    assert.match(ff.message, /No freeze frame/);
+  });
+
+  test('real car: readiness all complete, MIL off, odometer from 7EA', async () => {
+    const elm = new Elm327(new ReplayTransport(), new Logger());
+    const r0 = await elm.init();
+    const obd = new Obd(elm);
+    obd.protocolNumber = r0.protocolNumber;
+    const rd = await obd.readiness();
+    assert.equal(rd.milOn, false);
+    const used = rd.monitors.filter((m) => m.available);
+    assert.ok(used.length >= 4, 'expected several supported monitors');
+    assert.ok(used.every((m) => m.complete), 'all supported monitors complete');
+    const od = await obd.readPid(0xA6);
+    assert.equal(Math.round(od.value * 10), 2200851);
   });
 
   let passed = 0, failed = 0;

@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.0.5';
-import { BleTransport } from './ble.js?v=1.0.5';
-import { SimTransport } from './sim.js?v=1.0.5';
-import { Elm327 } from './elm.js?v=1.0.5';
-import { Obd, ecuLabel } from './obd.js?v=1.0.5';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.5';
-import { describeDtc } from './dtc-db.js?v=1.0.5';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.5';
-import { buildReport } from './report.js?v=1.0.5';
+import { logger } from './log.js?v=1.0.6';
+import { BleTransport } from './ble.js?v=1.0.6';
+import { SimTransport } from './sim.js?v=1.0.6';
+import { Elm327 } from './elm.js?v=1.0.6';
+import { Obd, ecuLabel, parseLines } from './obd.js?v=1.0.6';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.6';
+import { describeDtc } from './dtc-db.js?v=1.0.6';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.6';
+import { buildReport } from './report.js?v=1.0.6';
 
-var APP_VERSION = '1.0.5';
+var APP_VERSION = '1.0.6';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -471,7 +471,9 @@ function onTransportLost(t, reason) {
   var wasLive = S.live.running;
   try {
     var idle = S.elm ? Math.round(S.elm.idleMs() / 100) / 10 : null;
-    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + '.');
+    var rpm = S.live.values[0x0C];
+    var eng = rpm && typeof rpm.value === 'number' ? ', last engine speed ' + Math.round(rpm.value) + ' rpm (' + Math.round((Date.now() - rpm.at) / 100) / 10 + ' s ago)' : '';
+    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + eng + '.');
   } catch (e) { /* logging only */ }
   try { if (S.elm) S.elm.stopKeepAlive(); } catch (e) { /* ignore */ }
   S.live.running = false;
@@ -489,7 +491,41 @@ function onTransportLost(t, reason) {
   }
 }
 
-var RECONNECT_DELAYS = [700, 1500, 2500, 4000, 6000, 8000];
+var RECONNECT_DELAYS = [250, 1500, 2500, 4000, 6000, 8000];
+
+// After a drop the adapter usually still has its settings (echo off, headers on, protocol
+// found). One test request tells us. If the reply looks exactly as it did before the drop,
+// skip the full setup, which saves about 2.5 seconds per drop. Returns true when resumed.
+function quickResume(t, prev) {
+  var elm = S.elm;
+  var obd = S.obd;
+  if (!prev || !prev.elm || !prev.obd || !prev.init || !prev.init.ok) return Promise.resolve(false);
+  var known = prev.supported && prev.supported.byEcu ? Object.keys(prev.supported.byEcu) : [];
+  if (!known.length || !prev.obd.protocolNumber) return Promise.resolve(false);
+  return elm.send('0100', { timeout: 2500 }).then(function (r) {
+    if (!r || r.status !== 'ok' || !r.lines || !r.lines.length) return false;
+    var raw = String(r.raw || '');
+    if (/^\s*0100/.test(raw)) return false;                 // echo is back on: the adapter was reset
+    if (/ /.test(r.lines.join(''))) return false;            // spaces are back on
+    var parsed;
+    try { parsed = parseLines(r.lines, prev.obd.protocolNumber); } catch (e) { return false; }
+    if (!parsed || !parsed.length) return false;
+    for (var i = 0; i < parsed.length; i++) {
+      if (known.indexOf(parsed[i].ecu) < 0 || parsed[i].bytes[0] !== 0x41) return false;
+    }
+    elm.resumeFrom(prev.elm);
+    obd.protocolNumber = prev.obd.protocolNumber;
+    obd.supported = prev.obd.supported || null;
+    obd._multiPidOk = prev.obd._multiPidOk;
+    S.adapterOnly = false;
+    S.connected = true;
+    logger.log('info', 'Adapter kept its settings. Resumed without a full setup.');
+    setStatus('ok', 'Connected to the car. Everything below is ready to use.', 'Connected');
+    keepAwake(true);
+    elm.startKeepAlive(1500);
+    return true;
+  }, function () { return false; });
+}
 
 // After an unexpected Bluetooth drop: reconnect to the same adapter, set it up again and
 // carry on (including live data) without the user doing anything.
@@ -498,6 +534,7 @@ function autoReconnect(t, wasLive, reason) {
   S.connected = false;
   S.adapterOnly = false;
   var keepSel = S.live.selected.slice();
+  var prev = { elm: S.elm, obd: S.obd, supported: S.supported, init: S.init };
   logger.log('warn', 'Connection dropped' + (reason ? ' (' + reason + ')' : '') + '. Trying to reconnect automatically.');
   updateButtons();
   var attempt = 0;
@@ -535,7 +572,10 @@ function autoReconnect(t, wasLive, reason) {
           if (aborted()) return 'aborted';
           S.elm = new Elm327(t, logger);
           S.obd = new Obd(S.elm);
-          return talkToCar().then(function () {
+          return quickResume(t, prev).then(function (resumed) {
+            if (resumed || aborted() || !t.isConnected()) return;
+            return talkToCar();
+          }).then(function () {
             if (aborted()) return 'aborted';
             // The link can drop again while the adapter is being set up. That drop was
             // ignored because we were reconnecting, so treat it as a failed try.

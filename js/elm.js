@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.0.5';
+import { logger as defaultLogger } from './log.js?v=1.0.6';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -297,6 +297,16 @@ export class Elm327 {
       }
       cur.onPrompt(raw);
     }
+  }
+
+  // After a Bluetooth drop the adapter keeps its settings (it never lost power). Take over
+  // what the previous session learned so the app can carry on without a full setup.
+  resumeFrom(prev) {
+    this._headersOn = true;
+    this._afterProtocolSet = false;
+    this.elmVersion = prev.elmVersion;
+    this.protocol = prev.protocol;
+    this.protocolNumber = prev.protocolNumber;
   }
 
   // Milliseconds since the adapter last had a command in flight.

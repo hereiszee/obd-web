@@ -1,7 +1,7 @@
 // Builds a clean plain-text report from whatever the user has read so far.
 // Pure function, no DOM, no network. Text only, so it can be shared anywhere.
 
-import { describeDtc } from './dtc-db.js?v=1.0.5';
+import { describeDtc } from './dtc-db.js?v=1.0.6';
 
 var LINE = '========================================';
 var SUB = '----------------------------------------';

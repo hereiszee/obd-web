@@ -1,7 +1,7 @@
 // Builds a clean plain-text report from whatever the user has read so far.
 // Pure function, no DOM, no network. Text only, so it can be shared anywhere.
 
-import { describeDtc } from './dtc-db.js?v=1.0.9';
+import { describeDtc } from './dtc-db.js?v=1.1.0';
 
 var LINE = '========================================';
 var SUB = '----------------------------------------';
@@ -114,6 +114,13 @@ export function buildReport(data) {
       out.push('Source: Bluetooth adapter' + (conn.deviceName ? ' "' + conn.deviceName + '"' : ''));
     }
     if (conn.elmVersion) out.push('Adapter chip: ' + conn.elmVersion);
+    var di = conn.deviceInfo;
+    if (di) {
+      if (di.manufacturer || di.model) out.push('Adapter: ' + [di.manufacturer, di.model].filter(Boolean).join(' '));
+      if (di.firmware) out.push('Adapter firmware: ' + di.firmware);
+      if (di.hardware) out.push('Adapter hardware: ' + di.hardware);
+      if (di.software) out.push('Adapter software: ' + di.software);
+    }
     if (conn.protocol) out.push('Car protocol: ' + conn.protocol);
     if (conn.voltage) out.push('Battery voltage at the port: ' + conn.voltage);
   } else {

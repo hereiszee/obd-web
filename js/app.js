@@ -1,16 +1,16 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.0.9';
-import { BleTransport } from './ble.js?v=1.0.9';
-import { SimTransport } from './sim.js?v=1.0.9';
-import { Elm327 } from './elm.js?v=1.0.9';
-import { Obd, ecuLabel, parseLines } from './obd.js?v=1.0.9';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.0.9';
-import { describeDtc } from './dtc-db.js?v=1.0.9';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.0.9';
-import { buildReport } from './report.js?v=1.0.9';
+import { logger } from './log.js?v=1.1.0';
+import { BleTransport, DEVICE_INFO_FIELDS } from './ble.js?v=1.1.0';
+import { SimTransport } from './sim.js?v=1.1.0';
+import { Elm327 } from './elm.js?v=1.1.0';
+import { Obd, ecuLabel, parseLines } from './obd.js?v=1.1.0';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.1.0';
+import { describeDtc } from './dtc-db.js?v=1.1.0';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.1.0';
+import { buildReport } from './report.js?v=1.1.0';
 
-var APP_VERSION = '1.0.9';
+var APP_VERSION = '1.1.0';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -424,6 +424,7 @@ function talkToCar() {
         // connection dropped and this is an automatic reconnect.
         if (!S.reconnecting || !S.live.selected.length) setupLive();
         if (S.kind === 'ble') { keepAwake(true); if (S.elm) S.elm.startKeepAlive(1500); }
+        readAdapterInfo(t);
       });
   });
 }
@@ -433,6 +434,28 @@ function onRetry() {
   run('Asking the car again', talkToCar, $('connectMsg'));
 }
 
+// Reads the adapter's firmware version and similar fields once per new connection.
+// Bluetooth reads do not go through the ELM327 command queue, so they do not disturb it.
+function readAdapterInfo(t) {
+  if (!t || typeof t.readDeviceInfo !== 'function' || (t.info && t.info.deviceInfo)) return Promise.resolve();
+  return t.readDeviceInfo().then(function (di) {
+    logAdapterInfo(di);
+    if (S.transport === t) renderConnectInfo();
+  }, function () {});
+}
+
+function adapterInfoRows(di) {
+  var rows = [];
+  if (!di) return rows;
+  DEVICE_INFO_FIELDS.forEach(function (f) { if (di[f.key]) rows.push([f.label, di[f.key]]); });
+  return rows;
+}
+
+function logAdapterInfo(di) {
+  var rows = adapterInfoRows(di);
+  logger.log('info', 'Adapter info: ' + (rows.length ? rows.map(function (r) { return r[0] + ' = ' + r[1]; }).join(', ') : 'none reported'));
+}
+
 function renderConnectInfo() {
   var box = $('connectInfo');
   clear(box);
@@ -440,7 +463,10 @@ function renderConnectInfo() {
   var info = (S.transport && S.transport.info) || {};
   var rows = [];
   rows.push(['Source', S.kind === 'sim' ? 'Simulated car (' + (SCENARIO_LABELS[S.scenario] || SCENARIO_LABELS.normal) + ')' : (info.deviceName || 'Bluetooth adapter')]);
-  if (r.elmVersion) rows.push(['Adapter chip', r.elmVersion]);
+  if (r.elmVersion) rows.push(['Adapter chip', r.elmVersion + ' (the ELM327 command set it imitates, not its firmware)']);
+  var di = info.deviceInfo;
+  if (di && di.firmware) rows.push(['Adapter firmware', di.firmware]);
+  if (di && di.hardware) rows.push(['Adapter hardware', di.hardware]);
   // 'AUTO' alone means no protocol was found yet, which tells the user nothing.
   var proto = r.protocol ? String(r.protocol).replace(/^AUTO,\s*/i, '').trim() : '';
   if (proto && !/^AUTO$/i.test(proto)) rows.push(['Car protocol', proto]);
@@ -686,7 +712,20 @@ function onProbe() {
         ]));
       });
       out.appendChild(table);
-      out.appendChild(h('p', { class: 'muted small', text: 'Raw replies are in the debug console. Copy the log if you need help.' }));
+      var t = S.transport;
+      var p2 = t && typeof t.readDeviceInfo === 'function' ? t.readDeviceInfo() : Promise.resolve(null);
+      return p2.then(function (di) {
+        if (di) logAdapterInfo(di);
+        var rows = adapterInfoRows(di);
+        if (rows.length) {
+          out.appendChild(h('h3', { text: 'Adapter details' }));
+          var t2 = h('table', { class: 'table' });
+          rows.forEach(function (row) { t2.appendChild(h('tr', null, [h('td', { text: row[0] }), h('td', { class: 'val', text: row[1] })])); });
+          out.appendChild(t2);
+        }
+        renderConnectInfo();
+        out.appendChild(h('p', { class: 'muted small', text: 'Raw replies are in the debug console. Copy the log if you need help.' }));
+      });
     });
   }, out);
 }
@@ -1331,6 +1370,7 @@ function onBuildReport() {
         scenario: S.scenario,
         deviceName: info.deviceName || null,
         elmVersion: init.elmVersion || null,
+        deviceInfo: info.deviceInfo || null,
         protocol: init.protocol || null,
         protocolNumber: init.protocolNumber || null,
         voltage: init.voltage ? voltText(init.voltage) : null

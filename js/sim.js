@@ -183,6 +183,7 @@ export class SimTransport {
     this.canPadding = o.canPadding !== false;
     this._rand = typeof o.seed === 'number' ? mulberry32(o.seed) : Math.random;
     this.info = {
+      deviceInfo: null,
       deviceName: DEVICE_DESC,
       serviceUuid: SVC,
       writeUuid: CHR,
@@ -218,6 +219,12 @@ export class SimTransport {
     this._connected = false;
     this._abort();
     if (typeof this.onDisconnect === 'function') this.onDisconnect('Disconnected from the simulated adapter.');
+  }
+
+  // Same shape as BleTransport.readDeviceInfo, with clearly simulated values.
+  async readDeviceInfo() {
+    this.info.deviceInfo = { manufacturer: 'Simulated adapter', model: 'Sim', hardware: null, firmware: 'sim-1.0', software: null };
+    return this.info.deviceInfo;
   }
 
   isConnected() { return this._connected; }

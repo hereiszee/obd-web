@@ -1,7 +1,7 @@
 // BleTransport: talks to a BLE ELM327 adapter (for example Vgate vLinker MC+) over Web Bluetooth.
 // Connection happens entirely in this page. No pairing in phone settings is needed.
 
-import { logger as defaultLogger } from './log.js?v=1.0.9';
+import { logger as defaultLogger } from './log.js?v=1.1.0';
 
 function uuid16(n) {
   var h = n.toString(16);
@@ -18,8 +18,29 @@ export const CANDIDATE_SERVICES = [
   uuid16(0xfee7),                           // seen on a few clones
   'e7810a71-73ae-499d-8c15-faa9aef0c3f2',   // "ELM327 BLE" service (bef8d6c9 char)
   '6e400001-b5a3-f393-e0a9-e50e24dcca9e',   // Nordic UART
-  '49535343-fe7d-4ae5-8fa9-9fafd205e455'    // Microchip / ISSC transparent UART
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455',   // Microchip / ISSC transparent UART
+  uuid16(0x180a)                            // standard Device Information (firmware version etc.)
 ];
+
+// Device Information fields we read. Serial number (2A25), system ID (2A23), PnP ID (2A50)
+// and regulatory data (2A2A) are deliberately skipped: they identify the individual adapter.
+export const DEVICE_INFO_FIELDS = [
+  { key: 'manufacturer', label: 'Manufacturer', uuid: uuid16(0x2a29) },
+  { key: 'model', label: 'Model', uuid: uuid16(0x2a24) },
+  { key: 'hardware', label: 'Hardware revision', uuid: uuid16(0x2a27) },
+  { key: 'firmware', label: 'Firmware revision', uuid: uuid16(0x2a26) },
+  { key: 'software', label: 'Software revision', uuid: uuid16(0x2a28) }
+];
+
+function cleanText(dataView) {
+  var s = '';
+  for (var i = 0; i < dataView.byteLength; i++) {
+    var b = dataView.getUint8(i);
+    if (b === 0) break;
+    s += b >= 32 && b < 127 ? String.fromCharCode(b) : '';
+  }
+  return s.trim();
+}
 
 // Known notify/write pairs, in order of preference.
 var KNOWN_PAIRS = [
@@ -469,6 +490,35 @@ export class BleTransport {
     this._writeChar = null;
     this._server = null;
     this._writeChain = Promise.resolve();
+  }
+
+  // Reads the standard Device Information fields (firmware version and so on).
+  // Returns {manufacturer, model, hardware, firmware, software} with null for missing fields.
+  // Never throws: a missing service or a failed read just gives nulls.
+  async readDeviceInfo() {
+    var out = {};
+    DEVICE_INFO_FIELDS.forEach(function (f) { out[f.key] = null; });
+    var server = this._server;
+    if (!server || !server.connected) return out;
+    var svc;
+    try {
+      svc = await withTimeout(server.getPrimaryService(uuid16(0x180a)), 4000, 'Opening device information');
+    } catch (e) {
+      this._logger.log('info', 'Device information not available: ' + errText(e));
+      return out;
+    }
+    for (var i = 0; i < DEVICE_INFO_FIELDS.length; i++) {
+      var f = DEVICE_INFO_FIELDS[i];
+      if (!server.connected) break;
+      try {
+        var ch = await withTimeout(svc.getCharacteristic(f.uuid), 3000, 'Opening ' + f.label);
+        var v = await withTimeout(ch.readValue(), 3000, 'Reading ' + f.label);
+        var text = cleanText(v);
+        out[f.key] = text || null;
+      } catch (e) { /* field not present or not readable */ }
+    }
+    this.info.deviceInfo = out;
+    return out;
   }
 
   async disconnect() {

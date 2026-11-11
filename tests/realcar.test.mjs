@@ -350,6 +350,42 @@ export async function run() {
     assert.ok(Date.now() - t0 >= 230, 'two requests should take at least two pauses');
   });
 
+  test('1.1.0: reads firmware and model, never the serial number', async () => {
+    const enc = (t) => { const b = new TextEncoder().encode(t + '\0'); return new DataView(b.buffer); };
+    const read = [];
+    const field = (uuid, text) => ({ uuid, properties: { read: true }, async readValue() { read.push(uuid); return enc(text); } });
+    const dis = {
+      uuid: '180a',
+      async getCharacteristic(u) {
+        const map = {
+          '00002a29-0000-1000-8000-00805f9b34fb': field('2a29', 'Vgate'),
+          '00002a24-0000-1000-8000-00805f9b34fb': field('2a24', 'vLinker MC'),
+          '00002a26-0000-1000-8000-00805f9b34fb': field('2a26', 'V2.2.10'),
+          '00002a25-0000-1000-8000-00805f9b34fb': field('2a25', 'SERIAL-SECRET'),
+        };
+        if (!map[u]) throw new Error('NotFoundError');
+        return map[u];
+      },
+      async getCharacteristics() { return []; },
+    };
+    const t = new BleTransport({ logger: new Logger() });
+    t._server = { connected: true, async getPrimaryService(u) { if (u === '0000180a-0000-1000-8000-00805f9b34fb') return dis; throw new Error('NotFoundError'); } };
+    const di = await t.readDeviceInfo();
+    assert.equal(di.manufacturer, 'Vgate');
+    assert.equal(di.model, 'vLinker MC');
+    assert.equal(di.firmware, 'V2.2.10');
+    assert.equal(di.hardware, null);
+    assert.ok(!read.includes('2a25'), 'serial number must not be read');
+    assert.equal(t.info.deviceInfo.firmware, 'V2.2.10');
+  });
+
+  test('1.1.0: missing device information service gives nulls, no error', async () => {
+    const t = new BleTransport({ logger: new Logger() });
+    t._server = { connected: true, async getPrimaryService() { throw new Error('NotFoundError'); } };
+    const di = await t.readDeviceInfo();
+    assert.equal(di.firmware, null);
+  });
+
   let passed = 0, failed = 0;
   for (const t of tests) {
     try { await t.fn(); passed++; console.log('ok   ' + t.name); }

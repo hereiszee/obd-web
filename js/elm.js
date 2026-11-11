@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.0.6';
+import { logger as defaultLogger } from './log.js?v=1.0.9';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -134,6 +134,10 @@ export class Elm327 {
     var timeout = opts.timeout;
     if (timeout == null) {
       timeout = /^ATZ$/i.test(c.replace(/\s+/g, '')) ? 5000 : 4000;
+    }
+    if (this._closed) {
+      // This queue belongs to a link that has dropped. Never send on its behalf again.
+      return Promise.resolve(this._result(c, '', [], 'stopped'));
     }
     return new Promise(function (resolve) {
       self._queue.push({ cmd: c, timeout: timeout, resolve: resolve });
@@ -307,6 +311,15 @@ export class Elm327 {
     this.elmVersion = prev.elmVersion;
     this.protocol = prev.protocol;
     this.protocolNumber = prev.protocolNumber;
+  }
+
+  // Shuts this queue down for good. Used when the Bluetooth link drops, so code still
+  // holding this object (for example a live data loop that is winding down) cannot send
+  // stray commands once a new link is up.
+  close() {
+    this._closed = true;
+    this.stopKeepAlive();
+    this.cancelAll();
   }
 
   // Milliseconds since the adapter last had a command in flight.

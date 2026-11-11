@@ -325,6 +325,31 @@ export async function run() {
     assert.deepEqual(p.slice(-3), ['ATAR', 'ATSH7DF', '0100']);
   });
 
+  test('1.0.8: a closed command queue never sends again', async () => {
+    const tr = new ReplayTransport();
+    const sent = [];
+    const w = tr.write.bind(tr);
+    tr.write = (x) => { sent.push(x.trim()); return w(x); };
+    const elm = new Elm327(tr, new Logger());
+    await elm.send('ATRV');
+    elm.startKeepAlive(300);
+    elm.close();
+    const r = await elm.send('0100');
+    await new Promise((res) => setTimeout(res, 900));
+    assert.equal(r.status, 'stopped');
+    assert.deepEqual(sent, ['ATRV']);
+  });
+
+  test('1.0.8: live pacing waits between single requests', async () => {
+    const { obd } = await setup({ '010C': '7E804410C1E1A\r\r>', '010D': '7E803410D00\r\r>' });
+    obd.targetLive = undefined;
+    obd.gentleLive = true;
+    obd.liveGapMs = 120;
+    const t0 = Date.now();
+    await obd.readPids([0x0C, 0x0D]);
+    assert.ok(Date.now() - t0 >= 230, 'two requests should take at least two pauses');
+  });
+
   let passed = 0, failed = 0;
   for (const t of tests) {
     try { await t.fn(); passed++; console.log('ok   ' + t.name); }

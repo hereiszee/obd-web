@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.6';
-import { describeDtc } from './dtc-db.js?v=1.0.6';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.0.9';
+import { describeDtc } from './dtc-db.js?v=1.0.9';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -802,6 +802,13 @@ export class Obd {
     return pids.map((p) => results[p]);
   }
 
+  // Optional pause before each live request (liveGapMs). The app raises it after a
+  // Bluetooth drop so a struggling link gets less traffic.
+  _livePause() {
+    const ms = this.liveGapMs;
+    return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
+  }
+
   async _readPidsOn(pidList, header) {
     const pids = pidList;
     if (header && !(await this._setHeader(header))) {
@@ -820,7 +827,7 @@ export class Obd {
       for (let i = 0; i < pids.length; i += 6) {
         const chunk = pids.slice(i, i + 6);
         if (chunk.length === 1 || chunk.some((p) => !pidByteLength(p))) {
-          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j], qopts);
+          for (let j = 0; j < chunk.length; j++) { await this._livePause(); results[chunk[j]] = await this.readPid(chunk[j], qopts); }
           continue;
         }
         const q = await this.query('01' + chunk.map(hex2).join(''), qopts);
@@ -849,11 +856,11 @@ export class Obd {
             this._multiPidFails++;
             if (this._multiPidOk !== true || this._multiPidFails >= 3) this._multiPidOk = false;
           }
-          for (let j = 0; j < chunk.length; j++) results[chunk[j]] = await this.readPid(chunk[j], qopts);
+          for (let j = 0; j < chunk.length; j++) { await this._livePause(); results[chunk[j]] = await this.readPid(chunk[j], qopts); }
         }
       }
     } else {
-      for (let j = 0; j < pids.length; j++) results[pids[j]] = await this.readPid(pids[j], qopts);
+      for (let j = 0; j < pids.length; j++) { await this._livePause(); results[pids[j]] = await this.readPid(pids[j], qopts); }
     }
     return pids.map((p) => results[p]);
   }

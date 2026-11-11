@@ -1,7 +1,7 @@
 // BleTransport: talks to a BLE ELM327 adapter (for example Vgate vLinker MC+) over Web Bluetooth.
 // Connection happens entirely in this page. No pairing in phone settings is needed.
 
-import { logger as defaultLogger } from './log.js?v=1.0.6';
+import { logger as defaultLogger } from './log.js?v=1.0.9';
 
 function uuid16(n) {
   var h = n.toString(16);

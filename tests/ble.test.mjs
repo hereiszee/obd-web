@@ -321,9 +321,13 @@ export async function run() {
     assert.ok(/with response$/.test(t.lastDrop.writeModeText));
     f.writes.length = 0;
     await t.reconnect();
-    assert.equal(texts(log, /write mode with response\)$/).length, 2, 'next link still uses with response');
-    assert.equal(texts(log, /^Links so far: 2, drops: 1, .*, write mode with response$/).length, 1);
-    await t.disconnect();
+    assert.equal(texts(log, /^Changed on this link: /).length, 0, 'next link is the same as before (still with response)');
+    f.writes.length = 0;
+    const w = t.write('ATE0\r');
+    await sleep(5);
+    assert.equal(f.writes[0].mode, 'withResponse');
+    t.dropNow('test');
+    await assert.rejects(w);
   });
 
   test('1.2.0: quick refusal followed by a drop within 300 ms does not downgrade', async () => {
@@ -368,7 +372,7 @@ export async function run() {
     await sleep(20);
     assert.match(t.lastDrop.writeModeText, /^without response \(acknowledged writes switched off this session\)$/);
     await t.reconnect();
-    assert.equal(texts(log, /^Links so far: 2, .*write mode without response \(acknowledged writes switched off this session\)$/).length, 1);
+    assert.equal(texts(log, /^Changed on this link: Using notify .*write mode without response\)$/).length, 1, 'the downgrade shows in the log on reconnect');
     await t.disconnect();
   });
 
@@ -438,13 +442,16 @@ export async function run() {
     t.onData = (s) => { got += s; };
     f.chars.cbef8.fire('OK\r\r>');
     assert.equal(got, 'OK\r\r>', 'data delivered once');
-    assert.equal(texts(log, /^Links so far: 2, drops: 1, connected time: \d+\.\d s, average \d+\.\d s per drop, write mode with response$/).length, 1);
+    assert.equal(texts(log, /^Using notify /).length, 1, 'reconnect is quiet when nothing changed');
+    assert.equal(texts(log, /^Notifications started/).length, 1);
+    assert.equal(texts(log, /Reconnecting to/).length, 0);
+    assert.equal(t.sessionStats().links, 2);
     await t.disconnect();
   });
 
   // ---------------------------------------------------------------- drop instrumentation
 
-  test('1.2.0: unexpected drop dumps the last 12 notifications and the partial reply', async () => {
+  test('1.3.0: unexpected drop logs one line of last data plus the partial reply', async () => {
     const f = makeFake();
     const { t, log } = await connected(f);
     await t.write('0100\r');
@@ -454,12 +461,13 @@ export async function run() {
     f.gatt.disconnect();
     await sleep(20);
     const dump = texts(log, /^Last data before the drop: /);
-    assert.equal(dump.length, 12);
-    assert.match(dump[11].text, /, \d+ bytes, "7E80641⏎7E8"$/);
-    assert.match(dump[0].text, /^Last data before the drop: at \d+\.\d{3} s, \d+ bytes, ".*"$/);
+    assert.equal(dump.length, 1);
+    assert.match(dump[0].text, /^Last data before the drop: 11 bytes at \d+\.\d{3} s, ending "….{24}"$/);
+    assert.ok(dump[0].text.endsWith('⏎>7E80641⏎7E8"'), dump[0].text);
     const partial = texts(log, /^Partial reply at the drop: /);
     assert.equal(partial.length, 1);
     assert.equal(partial[0].text, 'Partial reply at the drop: "7E80641⏎7E8"');
+    assert.equal(texts(log, /^Adapter connection lost/).length, 0, 'the app describes the drop in one line');
     const d = t.lastDrop;
     assert.equal(d.channel, '18f0');
     assert.equal(d.writeModeText, 'with response');
@@ -467,6 +475,46 @@ export async function run() {
     assert.ok(d.rxBytes > 100);
     assert.ok(d.secondsSinceLastRx >= 0 && d.secondsSinceLastRx < 1);
     assert.ok(d.secondsSinceConnect >= 0);
+  });
+
+  test('1.3.0: fast stall closes the link itself: drop handled once, late browser event ignored', async () => {
+    const f = makeFake();
+    const { t, log } = await connected(f);
+    let lost = 0;
+    let reason = '';
+    t.onDisconnect = (r) => { lost++; reason = r; };
+    let gattDisconnects = 0;
+    const orig = f.gatt.disconnect;
+    f.gatt.disconnect = () => { gattDisconnects++; orig(); };
+    assert.equal(t.dropNow('no data for 0.7 s'), true);
+    assert.equal(t.dropNow('again'), false, 'only once');
+    assert.equal(lost, 1);
+    assert.equal(gattDisconnects, 1, 'the link is closed by us');
+    assert.ok(!/^Disconnected\.$/.test(reason), 'reported as an unexpected drop, not a user disconnect');
+    assert.equal(t._userDisconnect, false);
+    await t.reconnect(); // starts at once, before the browser's event for the old link arrives
+    await sleep(40);
+    assert.equal(lost, 1, 'the late event for the old link changed nothing');
+    assert.ok(t.isConnected(), 'the new link is still up');
+    assert.equal(texts(log, /already handled/).length, 0, 'our own close is not logged as late');
+    await t.disconnect();
+  });
+
+  test('1.3.0: radio trace is per link and uses the log clock', async () => {
+    const f = makeFake();
+    const { t, log } = await connected(f);
+    f.chars.c2af0.fire('OK\r\r>');
+    const mark = log.log('info', 'mark');
+    const tr = t.radioTrace();
+    assert.equal(tr.length, 1);
+    assert.ok(Math.abs(tr[0].t * 1000 - mark.t) < 20, 'ring ' + tr[0].t + ' s vs log ' + mark.t + ' ms');
+    f.gatt.disconnect();
+    await sleep(20);
+    await t.reconnect();
+    assert.equal(t.radioTrace().length, 0, 'cleared when the new link opened');
+    t.dropNow('test');
+    assert.equal(texts(log, /^Last data before the drop: nothing was received on this link\.$/).length, 1);
+    await sleep(20);
   });
 
   test('1.2.0: user disconnect does not dump the ring buffer', async () => {
@@ -544,57 +592,72 @@ export async function run() {
 
   function gateCtx(over) {
     const reads = { n: 0 };
+    const born = Date.now();
     const ctx = Object.assign({
       transport: { async readDeviceInfo() { reads.n++; return { firmware: 'V1' }; } },
       deviceName: 'Test adapter',
+      linkAgeMs: () => Date.now() - born,
       isHealthy: () => true,
       isLive: () => false,
       readyToRead: () => true,
+      sameLink: () => true,
       done: [],
     }, over || {});
     ctx.onDone = (di) => ctx.done.push(di);
     return { ctx, reads };
   }
 
-  test('1.2.0: adapter info is read once after a quiet window, then cached', async () => {
-    const gate = new AdapterInfoGate({ quietMs: 80, checkMs: 10 });
+  test('1.3.0: adapter info is read once the link has been up long enough, then cached', async () => {
+    const gate = new AdapterInfoGate({ linkUpMs: 80, checkMs: 10 });
     const { ctx, reads } = gateCtx();
     assert.equal(gate.arm(ctx), true);
     await sleep(30);
-    assert.equal(reads.n, 0, 'not before the quiet window');
+    assert.equal(reads.n, 0, 'not before the link is old enough');
     await sleep(150);
     assert.equal(reads.n, 1);
     assert.equal(gate.get('Test adapter').firmware, 'V1');
-    assert.equal(gate.arm(gateCtx().ctx), false, 'never armed again');
+    assert.equal(gate.arm(gateCtx().ctx), false, 'never armed again after a successful read');
     const again = await gate.readNow({ transport: ctx.transport, deviceName: 'Test adapter' });
     assert.equal(again.firmware, 'V1');
     assert.equal(reads.n, 1, 'probe reuses the cache');
   });
 
-  test('1.2.0: adapter info is never read on a reconnect or while live data runs', async () => {
-    const g1 = new AdapterInfoGate({ quietMs: 30, checkMs: 10 });
-    const a = gateCtx({ reconnect: true });
-    assert.equal(g1.arm(a.ctx), false);
-    await sleep(80);
-    assert.equal(a.reads.n, 0);
-
-    const g2 = new AdapterInfoGate({ quietMs: 30, checkMs: 10 });
+  test('1.3.0: adapter info waits for live data and a free queue, retries after an interrupted read', async () => {
+    const g2 = new AdapterInfoGate({ linkUpMs: 30, checkMs: 10 });
     let live = true;
-    const b = gateCtx({ isLive: () => live });
+    let pending = true;
+    const b = gateCtx({ isLive: () => live, readyToRead: () => !pending });
     g2.arm(b.ctx);
-    await sleep(150);
+    await sleep(120);
     assert.equal(b.reads.n, 0, 'postponed while live data runs');
     live = false;
-    await sleep(120);
-    assert.equal(b.reads.n, 1, 'read after live data stopped');
+    await sleep(60);
+    assert.equal(b.reads.n, 0, 'waits while a command is pending');
+    pending = false;
+    await sleep(60);
+    assert.equal(b.reads.n, 1, 'read once the queue is free');
 
-    const g3 = new AdapterInfoGate({ quietMs: 50, checkMs: 10 });
-    const c = gateCtx();
+    // A drop during the read: nothing is kept and a later link tries again.
+    const g3 = new AdapterInfoGate({ linkUpMs: 20, checkMs: 10 });
+    const c = gateCtx({ sameLink: () => false });
     g3.arm(c.ctx);
+    await sleep(80);
+    assert.equal(c.reads.n, 1);
+    assert.equal(g3.get('Test adapter'), null, 'interrupted read is not cached');
+    const d = gateCtx();
+    assert.equal(g3.arm(d.ctx), true, 'armed again on the next link');
+    await sleep(80);
+    assert.equal(d.reads.n, 1);
+    assert.equal(g3.get('Test adapter').firmware, 'V1');
+
+    // A young link that drops before the read is cancelled.
+    const g4 = new AdapterInfoGate({ linkUpMs: 50, checkMs: 10 });
+    const e = gateCtx();
+    g4.arm(e.ctx);
     await sleep(20);
-    g3.cancel(); // drop
+    g4.cancel();
     await sleep(100);
-    assert.equal(c.reads.n, 0, 'a drop cancels the read');
+    assert.equal(e.reads.n, 0, 'a drop cancels the read');
   });
 
   test('1.2.0: browser line parsed from the user agent', () => {

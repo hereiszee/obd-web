@@ -2,8 +2,8 @@
 // Works with the Elm327 class from ./elm.js (send(cmd) resolves {cmd, raw, lines, status, message}).
 // Plain ES2020, no dependencies beyond the sibling modules.
 
-import { decodePid, PIDS, MONITORS } from './pids.js?v=1.2.0';
-import { describeDtc } from './dtc-db.js?v=1.2.0';
+import { decodePid, PIDS, MONITORS } from './pids.js?v=1.3.0';
+import { describeDtc } from './dtc-db.js?v=1.3.0';
 
 // ---------------------------------------------------------------------------
 // Small helpers

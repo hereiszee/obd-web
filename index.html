@@ -11,7 +11,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>OBD Web</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M14 40a18 18 0 0 1 36 0' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M32 40l9-11' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='40' r='4' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="css/app.css?v=1.2.0">
+  <link rel="stylesheet" href="css/app.css?v=1.3.0">
 </head>
 <body>
   <header class="topbar">
@@ -37,6 +37,7 @@
 
       <p id="statusLine" class="status-line" aria-live="polite">Not connected. Follow the steps below, then tap Connect adapter.</p>
       <div id="connectInfo" class="kv" hidden></div>
+      <p id="dropCounter" class="muted small" aria-live="off" hidden></p>
       <div id="connectMsg" class="msg" hidden></div>
 
       <div class="btn-col">
@@ -50,6 +51,7 @@
               <option value="normal">Normal car</option>
               <option value="ignitionOff">Ignition off</option>
               <option value="legacy">Older car (pre CAN)</option>
+              <option value="flaky">Flaky Bluetooth</option>
             </select>
           </label>
         </div>
@@ -73,6 +75,8 @@
           <option value="withResponse">Acknowledged</option>
           <option value="withoutResponse">Unacknowledged (old behaviour)</option>
         </select>
+        <label class="check small"><input type="checkbox" id="fastStall" checked> <span>Reconnect early when the adapter goes quiet</span></label>
+        <p class="muted small">When the adapter stops sending in the middle of a reply, the app reconnects at once instead of waiting about 3 seconds for the phone to notice. Turn it off to compare.</p>
       </details>
       <div data-explain="connect"></div>
     </section>
@@ -126,6 +130,7 @@
       <div class="btn-row">
         <button id="btnLive" class="btn btn-primary" type="button">Start live data</button>
         <span id="liveRate" class="muted small rate" aria-live="off"></span>
+        <span id="liveHint" class="muted small" aria-live="polite" hidden>Reconnecting to the adapter...</span>
       </div>
       <details id="pickerBox" class="picker">
         <summary>Choose readings</summary>
@@ -214,6 +219,6 @@
   </div>
 
   <noscript><p class="wrap">This page needs JavaScript turned on. It still never sends your data anywhere.</p></noscript>
-  <script type="module" src="js/app.js?v=1.2.0"></script>
+  <script type="module" src="js/app.js?v=1.3.0"></script>
 </body>
 </html>

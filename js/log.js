@@ -52,6 +52,11 @@ export class Logger {
     return this._entries.slice();
   }
 
+  // Milliseconds on the same clock and origin as entry.t, so other timestamps line up with the log.
+  now() {
+    return Math.round((nowMs() - this._start) * 1000) / 1000;
+  }
+
   subscribe(fn) {
     var self = this;
     if (typeof fn !== 'function') return function () {};

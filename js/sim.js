@@ -7,6 +7,8 @@
 //                engine ECU 7E8 and hybrid control ECU 7EA.
 //   ignitionOff  adapter has power but the car is asleep: searches fail.
 //   legacy       older petrol car on ISO 9141-2 (protocol 3), headers 48 6B 10.
+//   flaky        the normal car, but the Bluetooth link goes silent every 8 to 20 s and must be
+//                reconnected (like the real vLinker). Options flakyMinMs, flakyMaxMs, noticeMs.
 //
 // Options: new SimTransport({ scenario, timeScale, noDataRate, canPadding, seed })
 //   timeScale   multiplies every delay (1 = realistic, 0.05 = fast tests)
@@ -178,6 +180,15 @@ export class SimTransport {
     this.onData = null;
     this.onDisconnect = null;
     this.scenario = (o.scenario === 'ignitionOff' || o.scenario === 'legacy') ? o.scenario : 'normal';
+    // 'flaky': a normal car, but the Bluetooth link goes silent every 8 to 20 s (like the real
+    // vLinker) and needs a reconnect. The adapter keeps its settings, as the real one does.
+    this.flaky = o.scenario === 'flaky';
+    this.flakyMinMs = typeof o.flakyMinMs === 'number' ? o.flakyMinMs : 8000;
+    this.flakyMaxMs = typeof o.flakyMaxMs === 'number' ? o.flakyMaxMs : 20000;
+    this.noticeMs = typeof o.noticeMs === 'number' ? o.noticeMs : 3000; // the phone notices a silent link after this
+    this._silent = false;
+    this._flakyTimer = null;
+    this.drops = 0;
     this.timeScale = typeof o.timeScale === 'number' ? o.timeScale : 1;
     this.noDataRate = typeof o.noDataRate === 'number' ? o.noDataRate : 0.05;
     this.canPadding = o.canPadding !== false;
@@ -212,10 +223,68 @@ export class SimTransport {
     this._connected = true;
     this._resetElm(true);
     this._resetCar();
+    this._armFlaky();
     return this.info;
   }
 
+  // Same shape as BleTransport.reconnect: the same adapter, no device list. ELM settings are kept.
+  async reconnect() {
+    this._stopFlaky();
+    this._abort();
+    this._connected = false;
+    await this._sleep(250 + this._rand() * 250);
+    this._silent = false;
+    this._connected = true;
+    this._armFlaky();
+    return this.info;
+  }
+
+  // Same shape as BleTransport.dropNow (fast stall): close the silent link at once.
+  dropNow() {
+    if (!this._connected) return false;
+    this._linkLost('The adapter connection was lost (simulated).');
+    return true;
+  }
+
+  _armFlaky() {
+    if (!this.flaky) return;
+    this._stopFlaky();
+    const self = this;
+    const ms = this.flakyMinMs + this._rand() * (this.flakyMaxMs - this.flakyMinMs);
+    this._flakyTimer = setTimeout(function () { self._goSilent(); }, ms * this.timeScale);
+  }
+
+  _stopFlaky() {
+    if (this._flakyTimer) clearTimeout(this._flakyTimer);
+    this._flakyTimer = null;
+  }
+
+  // The radio goes quiet mid-reply. Whatever is on its way is lost. The phone notices later.
+  _goSilent() {
+    this._flakyTimer = null;
+    if (!this._connected) return;
+    this._silent = true;
+    this._gen++;
+    this._timers.forEach((t) => clearTimeout(t));
+    this._timers = [];
+    const self = this;
+    this._flakyTimer = setTimeout(function () {
+      self._flakyTimer = null;
+      if (self._silent && self._connected) self._linkLost('The adapter connection was lost (simulated, phone noticed).');
+    }, this.noticeMs * this.timeScale);
+  }
+
+  _linkLost(reason) {
+    this._stopFlaky();
+    this._connected = false;
+    this._silent = false;
+    this.drops++;
+    this._abort();
+    if (typeof this.onDisconnect === 'function') this.onDisconnect(reason);
+  }
+
   async disconnect() {
+    this._stopFlaky();
     if (!this._connected) return;
     this._connected = false;
     this._abort();
@@ -239,6 +308,7 @@ export class SimTransport {
     if (!this._connected) throw new Error('The simulated adapter is not connected.');
     await this._sleep(2 + this._rand() * 8);
     if (!this._connected) return;
+    if (this._silent) return; // the radio is quiet: nothing reaches the adapter
     for (let i = 0; i < text.length; i++) {
       const ch = text.charAt(i);
       if (ch === '\n' || ch === '\0') continue;
@@ -261,6 +331,7 @@ export class SimTransport {
   // Test helper: pretend the BLE link dropped.
   simulateDrop() {
     if (!this._connected) return;
+    this._stopFlaky();
     this._connected = false;
     this._abort();
     if (typeof this.onDisconnect === 'function') this.onDisconnect('The adapter connection was lost (simulated).');

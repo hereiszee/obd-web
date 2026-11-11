@@ -1,20 +1,21 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger, describeUserAgent } from './log.js?v=1.2.0';
-import { BleTransport, DEVICE_INFO_FIELDS } from './ble.js?v=1.2.0';
-import { AdapterInfoGate } from './adapter-info.js?v=1.2.0';
-import { SimTransport } from './sim.js?v=1.2.0';
-import { Elm327 } from './elm.js?v=1.2.0';
-import { Obd, ecuLabel, parseLines } from './obd.js?v=1.2.0';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.2.0';
-import { describeDtc } from './dtc-db.js?v=1.2.0';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.2.0';
-import { buildReport } from './report.js?v=1.2.0';
+import { logger, describeUserAgent } from './log.js?v=1.3.0';
+import { BleTransport, DEVICE_INFO_FIELDS } from './ble.js?v=1.3.0';
+import { AdapterInfoGate } from './adapter-info.js?v=1.3.0';
+import { SimTransport } from './sim.js?v=1.3.0';
+import { Elm327 } from './elm.js?v=1.3.0';
+import { LinkKeeper, SETTLE_FIRST_MS } from './link.js?v=1.3.0';
+import { Obd, ecuLabel } from './obd.js?v=1.3.0';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.3.0';
+import { describeDtc } from './dtc-db.js?v=1.3.0';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.3.0';
+import { buildReport } from './report.js?v=1.3.0';
 
-var APP_VERSION = '1.2.0';
+var APP_VERSION = '1.3.0';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
-var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
+var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)', flaky: 'Flaky Bluetooth' };
 
 // ---------------------------------------------------------------- state
 
@@ -30,9 +31,11 @@ var S = {
   userDisconnecting: false,
   init: null,
   supported: null,
-  live: { running: false, promise: null, gen: 0, error: null, selected: [], values: {}, tiles: {}, openPid: null, gapMs: 0, drops: 0 },
+  live: { running: false, promise: null, gen: 0, error: null, selected: [], values: {}, tiles: {}, openPid: null },
   results: { check: null, vin: null, codes: null, readiness: null, freeze: null },
-  simAdapterInfo: null
+  simAdapterInfo: null,
+  keeper: null,
+  dropStats: { drops: 0, recovered: 0, recoverMsTotal: 0 }
 };
 
 // Bluetooth Device Information is read at most once per page session (see js/adapter-info.js).
@@ -231,7 +234,7 @@ function setDisabled(id, off) { $(id).disabled = !!off; }
 function updateButtons() {
   var hasT = !!S.transport;
   var live = S.live.running;
-  var ready = S.connected && !S.busy && !live && !S.live.promise;
+  var ready = S.connected && !S.busy && !S.reconnecting && !live && !S.live.promise;
 
   setDisabled('btnConnect', hasT || S.busy);
   setDisabled('btnSim', hasT || S.busy);
@@ -239,7 +242,7 @@ function updateButtons() {
   setDisabled('bleChannel', hasT || S.busy);
   setDisabled('bleWrite', hasT || S.busy);
   setDisabled('btnDisconnect', !hasT);
-  setDisabled('btnProbe', !hasT || S.busy || live);
+  setDisabled('btnProbe', !hasT || S.busy || S.reconnecting || live);
   show($('btnRetry'), S.adapterOnly && hasT);
   setDisabled('btnRetry', S.busy || !S.adapterOnly);
 
@@ -250,7 +253,7 @@ function updateButtons() {
   var lb = $('btnLive');
   lb.textContent = live ? 'Stop live data' : (stopping ? 'Stopping...' : 'Start live data');
   lb.className = live ? 'btn btn-danger' : 'btn btn-primary';
-  setDisabled('btnLive', live ? false : (stopping || !S.connected || S.busy || adapterInfo.isReading() || S.live.selected.length === 0));
+  setDisabled('btnLive', live ? false : (stopping || !S.connected || S.busy || S.reconnecting || adapterInfo.isReading() || S.live.selected.length === 0));
 
   // Explain why the main tools are greyed out, once, in the live card.
   if (live) setMsg($('liveMsg'), 'info', null, TEXT.live.stopFirst);
@@ -331,13 +334,12 @@ function onConnectBle() {
   run('Connecting to the adapter', function () {
     return p.then(function () {
       logger.log('info', 'Bluetooth link open to ' + ((t.info && t.info.deviceName) || 'adapter'));
-      S.live.gapMs = 0;
-      S.live.drops = 0;
       // The link is fragile for a second or two after connecting (several drops in real
-      // logs came 1 to 2 s after a connect). Stay quiet first.
-      logger.log('info', 'Letting the Bluetooth link settle for ' + (SETTLE_MS / 1000) + ' s...');
+      // logs came 1 to 2 s after a connect). Stay quiet first. Automatic reconnects use a
+      // much shorter pause (see js/link.js).
+      logger.log('info', 'Letting the Bluetooth link settle for ' + (SETTLE_FIRST_MS / 1000) + ' s...');
       setStatus('busy', 'Bluetooth link open. Letting it settle for a moment...', 'Connecting...');
-      return delay(SETTLE_MS).then(function () {
+      return delay(SETTLE_FIRST_MS).then(function () {
         if (!t.isConnected()) throw new Error('The adapter dropped the link right after connecting. Tap Connect adapter again.');
         return attach(t, 'ble', null);
       });
@@ -370,6 +372,9 @@ function attach(t, kind, scenario) {
   S.userDisconnecting = false;
   S.elm = new Elm327(t, logger);
   S.obd = new Obd(S.elm);
+  var fs = $('fastStall');
+  S.elm.fastStall = !fs || fs.checked;
+  S.keeper = typeof t.reconnect === 'function' ? makeKeeper(t) : null;
   var prev = t.onDisconnect;
   t.onDisconnect = function (reason) {
     if (typeof prev === 'function') { try { prev(reason); } catch (e) { /* ignore */ } }
@@ -455,18 +460,21 @@ function armAdapterInfo(t) {
     }
     return;
   }
+  var linkAtRead = null;
+  function linkNo() { return S.keeper ? S.keeper.links : 1; }
   adapterInfo.arm({
     transport: t,
     deviceName: t.info && t.info.deviceName,
-    reconnect: !!S.reconnecting,
+    linkAgeMs: function () { return S.keeper ? S.keeper.linkAgeMs() : 0; },
     isHealthy: function () {
       return S.transport === t && t.isConnected() && !S.reconnecting && !S.busy && (S.connected || S.adapterOnly);
     },
     isLive: function () { return S.live.running || !!S.live.promise; },
     readyToRead: function () { return !!S.elm && S.elm.idleMs() >= 100; },
-    beforeRead: function () { if (S.elm) S.elm.stopKeepAlive(); updateButtons(); },
+    sameLink: function () { return S.transport === t && t.isConnected() && !S.reconnecting && linkNo() === linkAtRead; },
+    beforeRead: function () { linkAtRead = linkNo(); if (S.elm) S.elm.stopKeepAlive(); updateButtons(); },
     afterRead: function () {
-      if (S.transport === t && S.elm && t.isConnected() && (S.connected || S.adapterOnly)) S.elm.startKeepAlive(1500);
+      if (S.transport === t && S.elm && t.isConnected() && !S.reconnecting && (S.connected || S.adapterOnly)) S.elm.startKeepAlive(1500);
       updateButtons();
     },
     onDone: function (di) {
@@ -526,6 +534,7 @@ function onDisconnectClick() {
   var t = S.transport;
   if (!t) return;
   S.userDisconnecting = true;
+  if (S.keeper) S.keeper.abort();
   S.live.running = false;
   try { if (S.elm) S.elm.cancelAll(); } catch (e) { /* ignore */ }
   Promise.resolve()
@@ -542,21 +551,18 @@ function onTransportLost(t, reason) {
   var user = S.userDisconnecting;
   var wasLive = S.live.running;
   adapterInfo.cancel();
-  try {
-    var idle = S.elm ? Math.round(S.elm.idleMs() / 100) / 10 : null;
-    var rpm = S.live.values[0x0C];
-    var eng = rpm && typeof rpm.value === 'number' ? ', last engine speed ' + Math.round(rpm.value) + ' rpm (' + Math.round((Date.now() - rpm.at) / 100) / 10 + ' s ago)' : '';
-    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + eng + linkDetails(t) + '.');
-  } catch (e) { /* logging only */ }
-  // A drop while auto-reconnecting is handled by the retry loop itself.
-  if (S.reconnecting && !user) return;
+  var details = '';
+  try { details = dropDetails(t, wasLive); } catch (e) { /* logging only */ }
+  // A drop nobody asked for: ride through it. Commands wait, live data keeps running.
+  if (!user && S.keeper && !S.keeper.aborted && (S.connected || S.adapterOnly || S.keeper.reconnecting)) {
+    if (!S.keeper.reconnecting) S.dropStats.drops++;
+    S.keeper.handleDrop('drop details: ' + details);
+    return;
+  }
+  logger.log('warn', 'Drop details: ' + details + '.');
   try { if (S.elm) S.elm.stopKeepAlive(); } catch (e) { /* ignore */ }
   S.live.running = false;
   try { if (S.elm) S.elm.cancelAll(); } catch (e) { /* ignore */ }
-  if (!user && S.kind === 'ble' && typeof t.reconnect === 'function' && !S.reconnecting) {
-    autoReconnect(t, wasLive, reason);
-    return;
-  }
   if (user) {
     dropTransport(t, 'Disconnected. You can unplug the adapter now.', 'idle');
   } else {
@@ -564,6 +570,13 @@ function onTransportLost(t, reason) {
     setMsg($('connectMsg'), 'bad', 'Connection lost',
       (reason ? String(reason) + ' ' : '') + 'This happens if the car turns off, the adapter is unplugged, or the phone moves out of range. Your results so far are kept. Tap Connect adapter to reconnect.');
   }
+}
+
+function dropDetails(t, wasLive) {
+  var idle = S.elm ? Math.round(S.elm.idleMs() / 100) / 10 : null;
+  var rpm = S.live.values[0x0C];
+  var eng = rpm && typeof rpm.value === 'number' ? ', last engine speed ' + Math.round(rpm.value) + ' rpm (' + Math.round((Date.now() - rpm.at) / 100) / 10 + ' s ago)' : '';
+  return 'page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + eng + linkDetails(t);
 }
 
 // Link facts from the transport for the "Drop details" line. Empty for the simulator.
@@ -578,137 +591,61 @@ function linkDetails(t) {
     (d.secondsSinceLastRx == null ? 'no data received on this link' : 'last byte ' + s1(d.secondsSinceLastRx) + ' s before the drop');
 }
 
-var RECONNECT_DELAYS = [250, 1500, 2500, 4000, 6000, 8000];
-var SETTLE_MS = 2000;
-// Pause between live requests after 0, 1, 2, 3+ drops in a row.
-var LIVE_GAPS = [0, 60, 150, 300];
-
-// After a drop the adapter usually still has its settings (echo off, headers on, protocol
-// found). One test request tells us. If the reply looks exactly as it did before the drop,
-// skip the full setup, which saves about 2.5 seconds per drop. Returns true when resumed.
-function quickResume(t, prev) {
-  var elm = S.elm;
-  var obd = S.obd;
-  if (!prev || !prev.elm || !prev.obd || !prev.init || !prev.init.ok) return Promise.resolve(false);
-  var known = prev.supported && prev.supported.byEcu ? Object.keys(prev.supported.byEcu) : [];
-  if (!known.length || !prev.obd.protocolNumber) return Promise.resolve(false);
-  return elm.send('0100', { timeout: 2500 }).then(function (r) {
-    if (!r || r.status !== 'ok' || !r.lines || !r.lines.length) return false;
-    var raw = String(r.raw || '');
-    if (/^\s*0100/.test(raw)) return false;                 // echo is back on: the adapter was reset
-    if (/ /.test(r.lines.join(''))) return false;            // spaces are back on
-    var parsed;
-    try { parsed = parseLines(r.lines, prev.obd.protocolNumber); } catch (e) { return false; }
-    if (!parsed || !parsed.length) return false;
-    for (var i = 0; i < parsed.length; i++) {
-      if (known.indexOf(parsed[i].ecu) < 0 || parsed[i].bytes[0] !== 0x41) return false;
+// Rides through drops for this transport (see js/link.js). Callers just see a slower reply.
+function makeKeeper(t) {
+  var hintTimer = null;
+  var keeper = new LinkKeeper({
+    transport: t,
+    elm: S.elm,
+    obd: S.obd,
+    logger: logger,
+    hooks: {
+      isAborted: function () { return S.userDisconnecting || S.transport !== t; },
+      onState: function () {
+        S.reconnecting = true;
+        setStatus('busy', 'The Bluetooth link dropped. Reconnecting... Keep the phone near the car.', 'Reconnecting...');
+        updateButtons();
+        if (hintTimer) clearTimeout(hintTimer);
+        // Only show the live data hint when the gap is long enough to notice.
+        hintTimer = setTimeout(function () {
+          hintTimer = null;
+          if (S.reconnecting && S.live.running && S.transport === t) show($('liveHint'), true);
+        }, 1000);
+      },
+      onRecovered: function (info) {
+        if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+        S.reconnecting = false;
+        S.dropStats.recovered++;
+        S.dropStats.recoverMsTotal += info.recoverMs;
+        renderDropCounter();
+        var sim = S.kind === 'sim' ? ' (simulated car)' : '';
+        if (S.connected) setStatus('ok', 'Connected to the car' + sim + '. Everything below is ready to use.', S.kind === 'sim' ? 'Simulated car' : 'Connected');
+        else setStatus('warn', 'The adapter is connected, but the car did not answer.');
+        if (S.kind === 'ble' && S.elm) { keepAwake(true); S.elm.startKeepAlive(1500); }
+        updateButtons();
+        armAdapterInfo(t);
+      },
+      onGiveUp: function () {
+        if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+        S.reconnecting = false;
+        S.live.running = false;
+        dropTransport(t, 'The adapter disconnected.', 'bad');
+        setMsg($('connectMsg'), 'bad', 'Connection lost',
+          'The app tried to reconnect several times without luck. Check the car is still ON or in READY and the adapter light is on, then tap Connect adapter. Your results so far are kept.');
+      }
     }
-    elm.resumeFrom(prev.elm);
-    obd.protocolNumber = prev.obd.protocolNumber;
-    obd.supported = prev.obd.supported || null;
-    obd._multiPidOk = prev.obd._multiPidOk;
-    S.adapterOnly = false;
-    S.connected = true;
-    logger.log('info', 'Adapter kept its settings. Resumed without a full setup.');
-    setStatus('ok', 'Connected to the car. Everything below is ready to use.', 'Connected');
-    keepAwake(true);
-    elm.startKeepAlive(1500);
-    return true;
-  }, function () { return false; });
+  });
+  return keeper;
 }
 
-// After an unexpected Bluetooth drop: reconnect to the same adapter, set it up again and
-// carry on (including live data) without the user doing anything.
-function autoReconnect(t, wasLive, reason) {
-  S.reconnecting = true;
-  S.connected = false;
-  S.adapterOnly = false;
-  var keepSel = S.live.selected.slice();
-  var prev = { elm: S.elm, obd: S.obd, supported: S.supported, init: S.init };
-  try { if (prev.elm && prev.elm.close) prev.elm.close(); } catch (e) { /* ignore */ }
-  if (wasLive) {
-    S.live.drops++;
-    S.live.gapMs = LIVE_GAPS[Math.min(S.live.drops, LIVE_GAPS.length - 1)];
-  }
-  logger.log('warn', 'Connection dropped' + (reason ? ' (' + reason + ')' : '') + '. Trying to reconnect automatically.');
-  updateButtons();
-  var attempt = 0;
-  function aborted() { return S.userDisconnecting || S.transport !== t; }
-  function waitIdle(ms) {
-    return new Promise(function (resolve) {
-      var waited = 0;
-      (function tick() {
-        if (!S.busy || waited >= ms) return resolve();
-        waited += 100;
-        setTimeout(tick, 100);
-      })();
-    });
-  }
-  function next() {
-    if (aborted()) { S.reconnecting = false; return; }
-    if (attempt >= RECONNECT_DELAYS.length) {
-      S.reconnecting = false;
-      logger.log('error', 'Could not reconnect after ' + attempt + ' tries.');
-      dropTransport(t, 'The adapter disconnected.', 'bad');
-      setMsg($('connectMsg'), 'bad', 'Connection lost',
-        'The app tried to reconnect ' + attempt + ' times without luck. Check the car is still ON or in READY and the adapter light is on, then tap Connect adapter. Your results so far are kept.');
-      return;
-    }
-    var waitMs = RECONNECT_DELAYS[attempt];
-    attempt++;
-    setStatus('busy', 'The Bluetooth link dropped. Reconnecting (try ' + attempt + ' of ' + RECONNECT_DELAYS.length + ')... Keep the phone near the car.', 'Reconnecting...');
-    setTimeout(function () {
-      if (aborted()) { S.reconnecting = false; return; }
-      waitIdle(6000).then(function () {
-        if (aborted()) { S.reconnecting = false; return; }
-        S.busy = true;
-        updateButtons();
-        return t.reconnect().then(function () {
-          if (aborted()) return 'aborted';
-          S.elm = new Elm327(t, logger);
-          S.obd = new Obd(S.elm);
-          logger.log('info', 'Letting the Bluetooth link settle for ' + (SETTLE_MS / 1000) + ' s...');
-          return delay(SETTLE_MS).then(function () {
-            if (aborted()) return true;
-            if (!t.isConnected()) throw new Error('The link dropped again while settling');
-            return quickResume(t, prev);
-          }).then(function (resumed) {
-            if (resumed || aborted() || !t.isConnected()) return;
-            return talkToCar();
-          }).then(function () {
-            if (aborted()) return 'aborted';
-            // The link can drop again while the adapter is being set up. That drop was
-            // ignored because we were reconnecting, so treat it as a failed try.
-            if (!t.isConnected()) throw new Error('The link dropped again during setup');
-            return 'done';
-          });
-        });
-      }).then(function (res) {
-        S.busy = false;
-        S.reconnecting = false;
-        if (res !== 'done') { updateButtons(); return; }
-        if (!S.connected) { updateButtons(); return; }
-        // Keep the readings the user picked.
-        var avail = supportedLivePids();
-        var sel = keepSel.filter(function (p) { return avail.indexOf(p) >= 0; });
-        if (sel.length) { S.live.selected = sel; renderPicker(avail); renderTiles(); }
-        else if (!S.live.selected.length) setupLive();
-        setMsg($('connectMsg'), 'ok', 'Reconnected', 'The Bluetooth link dropped for a moment and the app reconnected by itself.' + (wasLive ? ' Live data has restarted.' : ''));
-        updateButtons();
-        // The old live loop may still be winding down. Start the new one once it has.
-        if (wasLive) (S.live.promise || Promise.resolve()).then(function () {
-          if (S.connected && !S.busy && !S.live.running && S.transport === t) onLiveToggle();
-        });
-      }, function (e) {
-        S.busy = false;
-        updateButtons();
-        logger.log('warn', 'Reconnect try ' + attempt + ' failed: ' + errMsg(e));
-        S.reconnecting = true;
-        next();
-      });
-    }, waitMs);
-  }
-  next();
+function renderDropCounter() {
+  var el = $('dropCounter');
+  if (!el) return;
+  var d = S.dropStats;
+  if (!d.drops) { show(el, false); return; }
+  var avg = d.recovered ? ' (recovered in ' + (d.recoverMsTotal / d.recovered / 1000).toFixed(1) + ' s on average)' : '';
+  el.textContent = 'Link drops this session: ' + d.drops + avg;
+  show(el, true);
 }
 
 // Keep the screen on while connected. iOS can drop Bluetooth when the phone locks.
@@ -764,7 +701,10 @@ function dropTransport(t, text, kind) {
   S.connected = false;
   S.adapterOnly = false;
   S.reconnecting = false;
+  if (S.keeper) S.keeper.abort();
+  S.keeper = null;
   S.live.running = false;
+  show($('liveHint'), false);
   keepAwake(false);
   setStatus(kind || 'idle', text);
   show($('connectInfo'), false);
@@ -1298,6 +1238,7 @@ function paintTile(pid, r) {
   var ok = r && (r.value != null || r.text != null) && r.status !== 'nodata' && r.status !== 'timeout';
   t.tile.classList.toggle('stale', !ok);
   if (!ok) { t.valEl.textContent = '--'; return; }
+  show($('liveHint'), false);
   var isNum = typeof r.value === 'number' && isFinite(r.value);
   var display;
   if (isNum) {
@@ -1390,13 +1331,13 @@ function onLiveToggle() {
   if (S.live.running) { stopLive(); return; }
   // A previous loop is still finishing its last request: wait for it (the button is disabled meanwhile).
   if (S.live.promise) return;
-  if (!S.connected || S.busy || !S.live.selected.length) return;
+  if (!S.connected || S.busy || S.reconnecting || !S.live.selected.length) return;
   if (adapterInfo.isReading()) return; // a one-off Bluetooth read, takes about a second
   var gen = ++S.live.gen;
   var lm = $('liveMode');
   if (S.obd) S.obd.gentleLive = !lm || lm.value !== 'fast';
-  if (S.obd) S.obd.liveGapMs = S.kind === 'ble' ? S.live.gapMs : 0;
-  if (S.obd && S.obd.liveGapMs) logger.log('info', 'Live pacing: ' + S.obd.liveGapMs + ' ms pause between requests (after ' + S.live.drops + ' drop' + (S.live.drops === 1 ? '' : 's') + ').');
+  // Live data always runs at the chosen mode's normal pace. Load does not cause the drops.
+  if (S.obd) S.obd.liveGapMs = 0;
   logger.log('info', 'Live mode: ' + (S.obd && S.obd.gentleLive ? 'steady (one reading per request)' : 'fast (several readings per request)'));
   S.live.running = true;
   S.live.error = null;
@@ -1590,6 +1531,11 @@ function bind() {
   $('btnReadiness').addEventListener('click', onReadiness);
   $('btnFreeze').addEventListener('click', onFreeze);
   $('btnLive').addEventListener('click', onLiveToggle);
+  $('fastStall').addEventListener('change', function () {
+    var on = $('fastStall').checked;
+    if (S.elm) S.elm.fastStall = on;
+    logger.log('info', 'Reconnect early when the adapter goes quiet: ' + (on ? 'on' : 'off') + '.');
+  });
   document.addEventListener('visibilitychange', function () {
     logger.log('info', 'Page is now ' + document.visibilityState + (document.visibilityState === 'hidden' ? ' (phone locked or another app in front). iOS may drop Bluetooth while hidden.' : '.'));
     if (document.visibilityState === 'visible' && S.connected && S.kind === 'ble') keepAwake(true);

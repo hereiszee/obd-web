@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.2.0';
+import { logger as defaultLogger } from './log.js?v=1.3.0';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -103,11 +103,45 @@ export function parseReply(cmd, raw) {
   return { lines: lines, status: status };
 }
 
+// How long a pending command may go without a single byte before the link is treated as dead
+// (fast stall). Returns milliseconds, or null when the command is known to be slow before its
+// first byte (resets, searches, trouble codes, clear codes, mode 09, explicit long timeouts).
+// opts: {timeout (only when given explicitly), afterProtocolSet}
+export var FAST_STALL_LIVE_MS = 700;
+export var FAST_STALL_OTHER_MS = 1500;
+export function fastStallMs(cmd, opts) {
+  var c = norm(cmd);
+  opts = opts || {};
+  if (opts.timeout != null && opts.timeout >= 5000) return null;
+  if (c === 'ATZ' || c === 'ATWS' || c === 'ATD') return null;
+  if (c === 'ATRV') return FAST_STALL_LIVE_MS;
+  if (/^AT/.test(c)) return FAST_STALL_OTHER_MS;
+  if (c === '03' || c === '07' || c === '0A' || c === '04') return null;
+  if (/^09/.test(c)) return null;
+  if (opts.afterProtocolSet) return null; // first request after a protocol search
+  if (/^01[0-9A-F]{2}$/.test(c)) return FAST_STALL_LIVE_MS;
+  return FAST_STALL_OTHER_MS;
+}
+
+// Commands that must never be sent twice by an automatic retry. Clear codes (04) changes the car.
+export function isIdempotent(cmd) {
+  return norm(cmd) !== '04';
+}
+
+var MAX_RETRIES = 2;
+var UNKNOWN_RESULT = 'The Bluetooth link dropped while this request was pending, so the result is unknown. Read the trouble codes again to check whether they were cleared.';
+
 export class Elm327 {
   constructor(transport, logger) {
     this.transport = transport;
     this.logger = logger || defaultLogger;
     this._queue = [];
+    this._prio = [];          // commands sent while resuming a link, they run even while held
+    this._priorityMode = false;
+    this._held = false;       // automatic reconnect in progress: keep commands, send nothing
+    this._holdTimer = null;
+    this._pumpGen = 0;
+    this._inflight = null;
     this._busy = false;
     this._current = null;
     this._headersOn = false;
@@ -117,7 +151,10 @@ export class Elm327 {
     this.protocolNumber = null;
     this._lastActivity = Date.now();
     this._keepAliveTimer = null;
-    this.stallMs = 1000;   // a pending command with no bytes for longer than this is logged as a stall
+    this.stallMs = 1000;      // without fast stall: a pending command with no bytes for longer than this is logged as a stall
+    this.fastStall = false;   // when true, a quiet link is dropped and reconnected early (see fastStallMs)
+    this.lastByteAt = null;   // Date.now() of the last byte from the adapter
+    this._linkReplies = 0;    // complete replies received on the current link
     var self = this;
     if (transport) {
       transport.onData = function (chunk) { self._onData(chunk); };
@@ -128,6 +165,7 @@ export class Elm327 {
     return this._headersOn;
   }
 
+  // opts: {timeout, idempotent}. idempotent defaults to true except for 04 (clear codes).
   send(cmd, opts) {
     var self = this;
     opts = opts || {};
@@ -140,16 +178,27 @@ export class Elm327 {
       // This queue belongs to a link that has dropped. Never send on its behalf again.
       return Promise.resolve(this._result(c, '', [], 'stopped'));
     }
+    var idem = opts.idempotent != null ? !!opts.idempotent : isIdempotent(c);
     return new Promise(function (resolve) {
-      self._queue.push({ cmd: c, timeout: timeout, resolve: resolve });
+      var job = { cmd: c, timeout: timeout, explicitTimeout: opts.timeout != null ? opts.timeout : null, idempotent: idem, retries: 0, prio: self._priorityMode, resolve: resolve };
+      if (self._priorityMode) self._prio.push(job); else self._queue.push(job);
       self._pump();
     });
   }
 
+  _nextJob() {
+    if (this._prio.length) return this._prio.shift();
+    if (this._held) return null;
+    return this._queue.shift() || null;
+  }
+
   _pump() {
-    if (this._busy || this._queue.length === 0) return;
+    if (this._busy) return;
+    var job = this._nextJob();
+    if (!job) return;
     this._busy = true;
-    var job = this._queue.shift();
+    this._inflight = job;
+    var gen = this._pumpGen;
     var self = this;
     this._lastActivity = Date.now();
     this._run(job).then(function (res) {
@@ -158,9 +207,12 @@ export class Elm327 {
       self.logger.log('error', 'Command ' + job.cmd + ' failed: ' + (e && e.message ? e.message : String(e)));
       return self._result(job.cmd, '', [], 'stopped');
     }).then(function (res) {
+      if (gen !== self._pumpGen) return null; // held by a reconnect: the job lives on in the queue
+      self._inflight = null;
       job.resolve(res);
       return res.status === 'timeout' ? self._resync() : null;
     }).then(null, function () { /* resync errors are logged inside */ }).then(function () {
+      if (gen !== self._pumpGen) return;
       self._lastActivity = Date.now();
       self._busy = false;
       self._pump();
@@ -173,35 +225,57 @@ export class Elm327 {
     return { cmd: cmd, raw: raw, lines: lines, status: status, message: message };
   }
 
+  _connected() {
+    var t = this.transport;
+    return !!t && (typeof t.isConnected !== 'function' || t.isConnected());
+  }
+
   _run(job) {
     var self = this;
     var cmd = job.cmd;
     var timeout = job.timeout;
     var obd = !isAtCommand(cmd);
-    if (obd && this._afterProtocolSet) {
+    var afterSearch = obd && this._afterProtocolSet;
+    if (afterSearch) {
       if (timeout < 10000) timeout = 10000;
     }
 
-    if (!this.transport || (typeof this.transport.isConnected === 'function' && !this.transport.isConnected())) {
+    if (!this._connected()) {
       return Promise.resolve(this._result(cmd, '', [], 'stopped', 'Not connected to the adapter.'));
     }
+
+    // Fast stall applies once this link has given at least one complete reply.
+    var fastMs = this.fastStall && this._linkReplies > 0
+      ? fastStallMs(cmd, { timeout: job.explicitTimeout, afterProtocolSet: afterSearch })
+      : null;
 
     return new Promise(function (resolve) {
       var done = false;
       var timer = null;
-      // Stall watch: warn once when a pending command gets no bytes for more than stallMs.
       var lastByteAt = Date.now();
       var stalledSince = null;
       var stallTimer = null;
+      function clearStall() { if (stallTimer) clearTimeout(stallTimer); stallTimer = null; }
       function armStall() {
-        if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(function () {
-          stallTimer = null;
-          if (done || stalledSince !== null) return;
-          stalledSince = lastByteAt;
-          self.logger.log('warn', 'Adapter stalled for ' + ((Date.now() - lastByteAt) / 1000).toFixed(1) +
-            ' s (no data while waiting for the reply to ' + cmd + ').');
-        }, self.stallMs + 1);
+        clearStall();
+        if (fastMs != null) {
+          stallTimer = setTimeout(function () {
+            stallTimer = null;
+            if (done) return;
+            var t = self.transport;
+            self.logger.log('warn', 'No data for ' + (fastMs / 1000).toFixed(1) + ' s. Reconnecting without waiting for the phone to notice.');
+            if (t && typeof t.dropNow === 'function') t.dropNow('no data for ' + (fastMs / 1000).toFixed(1) + ' s');
+          }, fastMs);
+        } else {
+          // Watch only: warn once when a pending command gets no bytes for more than stallMs.
+          stallTimer = setTimeout(function () {
+            stallTimer = null;
+            if (done || stalledSince !== null) return;
+            stalledSince = lastByteAt;
+            self.logger.log('warn', 'Adapter stalled for ' + ((Date.now() - lastByteAt) / 1000).toFixed(1) +
+              ' s (no data while waiting for the reply to ' + cmd + ').');
+          }, self.stallMs + 1);
+        }
         if (stallTimer && typeof stallTimer === 'object' && typeof stallTimer.unref === 'function') stallTimer.unref();
       }
       var current = {
@@ -211,9 +285,17 @@ export class Elm327 {
           if (done) return;
           done = true;
           if (timer) clearTimeout(timer);
-          if (stallTimer) clearTimeout(stallTimer);
+          clearStall();
           if (self._current === current) self._current = null;
           resolve(res);
+        },
+        // Used by hold(): stop watching without answering the caller.
+        detach: function () {
+          if (done) return;
+          done = true;
+          if (timer) clearTimeout(timer);
+          clearStall();
+          if (self._current === current) self._current = null;
         },
         onChunk: function () {
           var now = Date.now();
@@ -222,11 +304,14 @@ export class Elm327 {
               ' s (reply to ' + cmd + ').');
             stalledSince = null;
           }
+          // A search can take seconds before the answer. No fast stall for the rest of it.
+          if (fastMs != null && /^\s*SEARCHING/i.test(current.buffer)) fastMs = null;
           lastByteAt = now;
           if (!done) armStall();
         },
         onPrompt: function (raw) {
           self.logger.log('rx', raw + '>');
+          self._linkReplies++;
           var parsed = parseReply(cmd, raw);
           self._noteState(cmd, parsed);
           current.finish(self._result(cmd, raw, parsed.lines, parsed.status));
@@ -248,7 +333,9 @@ export class Elm327 {
       Promise.resolve().then(function () {
         return self.transport.write(cmd + '\r');
       }).then(null, function (e) {
-        self.logger.log('error', 'Write failed for ' + cmd + ': ' + (e && e.message ? e.message : String(e)));
+        if (done) return; // held or answered meanwhile
+        // A write failing because the link just dropped is part of the drop, not a separate error.
+        if (self._connected()) self.logger.log('error', 'Write failed for ' + cmd + ': ' + (e && e.message ? e.message : String(e)));
         current.finish(self._result(cmd, '', [], 'stopped', 'Could not send to the adapter. It may have disconnected.'));
       });
     });
@@ -258,7 +345,7 @@ export class Elm327 {
   _resync() {
     var self = this;
     var t = this.transport;
-    if (!t || (typeof t.isConnected === 'function' && !t.isConnected())) return Promise.resolve();
+    if (!this._connected()) return Promise.resolve();
     return new Promise(function (resolve) {
       var done = false;
       var quiet = null;
@@ -284,9 +371,10 @@ export class Elm327 {
           quiet = setTimeout(sink.finish, RESYNC_QUIET_MS);
         }
       };
+      sink.detach = sink.finish;
       self._current = sink;
       deadline = setTimeout(function () {
-        self.logger.log('warn', 'The adapter did not return to its prompt after a timeout. Continuing anyway.');
+        if (self._connected()) self.logger.log('warn', 'The adapter did not return to its prompt after a timeout. Continuing anyway.');
         sink.finish();
       }, RESYNC_DEADLINE_MS);
       self.logger.log('info', 'Resynchronising with the adapter after a timeout.');
@@ -294,7 +382,7 @@ export class Elm327 {
       Promise.resolve().then(function () {
         return t.write('\r');
       }).then(null, function (e) {
-        self.logger.log('warn', 'Resync write failed: ' + (e && e.message ? e.message : String(e)));
+        if (self._connected()) self.logger.log('warn', 'Resync write failed: ' + (e && e.message ? e.message : String(e)));
         sink.finish();
       });
     });
@@ -311,6 +399,7 @@ export class Elm327 {
   }
 
   _onData(chunk) {
+    this.lastByteAt = Date.now();
     var cur = this._current;
     if (!cur) {
       if (chunk && chunk.replace(/[\s>]/g, '')) {
@@ -331,6 +420,102 @@ export class Elm327 {
       cur.onPrompt(raw);
     }
   }
+
+  // ---- automatic reconnect support (see js/link.js) ----
+
+  // The link dropped and an automatic reconnect starts. Nothing is sent and nothing is failed:
+  // the command in flight goes back to the front of the queue to be sent again once (at most
+  // MAX_RETRIES times across drops), the rest wait in order. Commands that must not be repeated
+  // (04 clear codes) are failed with a "result unknown" message. After holdMs in total the
+  // waiting commands fail. Calling hold() again while held keeps the original deadline.
+  hold(holdMs) {
+    if (this._closed) return;
+    var self = this;
+    this.stopKeepAlive();
+    var job = this._inflight;
+    var cur = this._current;
+    this._pumpGen++;
+    this._busy = false;
+    this._inflight = null;
+    this._current = null;
+    if (cur && typeof cur.detach === 'function') cur.detach();
+    var prio = this._prio;
+    this._prio = [];
+    for (var i = 0; i < prio.length; i++) prio[i].resolve(this._result(prio[i].cmd, '', [], 'stopped', 'The link dropped again.'));
+    if (job && job.prio) job.resolve(this._result(job.cmd, '', [], 'stopped', 'The link dropped again.'));
+    else if (job) this.requeue(job);
+    this._queue = this._queue.filter(function (j) {
+      if (j.idempotent) return true;
+      j.resolve(self._result(j.cmd, '', [], 'stopped', UNKNOWN_RESULT));
+      return false;
+    });
+    this._held = true;
+    if (!this._holdTimer) {
+      this._holdTimer = setTimeout(function () {
+        self._holdTimer = null;
+        var n = self._queue.length;
+        var q = self._queue;
+        self._queue = [];
+        q.forEach(function (j) { j.resolve(self._result(j.cmd, '', [], 'stopped', 'The adapter did not come back in time. Not connected to the adapter.')); });
+        if (n) self.logger.log('warn', 'Waited ' + Math.round((holdMs || 12000) / 1000) + ' s for the adapter to come back. ' + n + ' waiting request(s) failed.');
+      }, holdMs || 12000);
+    }
+  }
+
+  // Puts a held command back at the front of the queue for one more send, or fails it.
+  requeue(job) {
+    if (!job.idempotent) {
+      job.resolve(this._result(job.cmd, '', [], 'stopped', UNKNOWN_RESULT));
+      return false;
+    }
+    if (job.retries >= MAX_RETRIES) {
+      job.resolve(this._result(job.cmd, '', [], 'stopped', 'Could not send to the adapter. It may have disconnected.'));
+      return false;
+    }
+    job.retries++;
+    job.wasInFlight = true;
+    this._queue.unshift(job);
+    return true;
+  }
+
+  // The interrupted command, removed from the queue so the reconnect can send it first.
+  takeInterrupted() {
+    var j = this._queue[0];
+    if (j && j.wasInFlight) { this._queue.shift(); j.wasInFlight = false; return j; }
+    return null;
+  }
+
+  // Puts a command taken with takeInterrupted() back unchanged (it was not sent again).
+  restoreInterrupted(job) {
+    job.wasInFlight = true;
+    this._queue.unshift(job);
+  }
+
+  // Hands a reply to a command taken with takeInterrupted().
+  deliver(job, res) { job.resolve(res); }
+
+  // Runs fn with every send going to the priority queue, which works while held.
+  priority(fn) {
+    var self = this;
+    this._priorityMode = true;
+    return Promise.resolve().then(fn).then(function (v) { self._priorityMode = false; return v; },
+      function (e) { self._priorityMode = false; throw e; });
+  }
+
+  // A new link is up. Fast stall waits for its first complete reply again.
+  linkReset() {
+    this._linkReplies = 0;
+  }
+
+  // Lets held commands go out again, in order.
+  resume() {
+    if (this._holdTimer) clearTimeout(this._holdTimer);
+    this._holdTimer = null;
+    this._held = false;
+    this._pump();
+  }
+
+  isHeld() { return this._held; }
 
   // After a Bluetooth drop the adapter keeps its settings (it never lost power). Take over
   // what the previous session learned so the app can carry on without a full setup.
@@ -376,7 +561,10 @@ export class Elm327 {
   }
 
   cancelAll() {
-    var queued = this._queue;
+    if (this._holdTimer) clearTimeout(this._holdTimer);
+    this._holdTimer = null;
+    var queued = this._prio.concat(this._queue);
+    this._prio = [];
     this._queue = [];
     for (var i = 0; i < queued.length; i++) {
       queued[i].resolve(this._result(queued[i].cmd, '', [], 'stopped'));

@@ -74,8 +74,13 @@ BleTransport details:
 - write(): encode ASCII, split into 20-byte chunks, strictly one write in flight (await each, also across messages).
   Write mode "auto" = writeValueWithResponse when the char has `write` and the method exists, else
   writeValueWithoutResponse, else writeValue. A write not confirmed within 3 s rejects as a send error.
-- Device Information (180A) is read at most once per page session by the app (js/adapter-info.js), never on reconnects
-  and never during live data.
+- Device Information (180A) is read once per page session (js/adapter-info.js): on the first link that has stayed up
+  8 s, with no command pending and live data stopped. An interrupted read is retried on a later link.
+- 1.3.0 ride through drops (js/link.js LinkKeeper): on an unexpected drop the Elm327 queue is held (up to 12 s), the
+  same adapter is reconnected at once, 300 ms settle (2 s only on the first manual connect), the interrupted command is
+  resent (at most 2 retries) and its reply shape checked (echo, spaces, header); a reset adapter gets a full init first.
+  04 (clear codes) is never held or resent. Obd header becomes 'unknown' after every reconnect. Fast stall (elm.js
+  fastStallMs): no byte for 0.7 s (single PID, ATRV) or 1.5 s (others) closes the link via transport.dropNow().
 - Handle gattserverdisconnected → onDisconnect.
 - If `navigator.bluetooth` missing, throw Error with plain-English message: on iPhone use the Bluefy browser,
   on desktop use Chrome or Edge.

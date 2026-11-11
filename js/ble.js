@@ -5,7 +5,7 @@
 // service 18F0, notify 2AF0, write 2AF1, write WITH response, one write in flight at a time,
 // at most 20 bytes per write, and nothing else touched on the GATT server while a session runs.
 
-import { logger as defaultLogger } from './log.js?v=1.2.0';
+import { logger as defaultLogger } from './log.js?v=1.3.0';
 
 function uuid16(n) {
   var h = n.toString(16);
@@ -67,7 +67,8 @@ var WRITE_RELEASE_MS = 10000;     // a write that never settles stops blocking t
 var POLL_MS = 250;                // how often the GATT connected flag is checked
 var EVENT_WAIT_MS = 2000;         // how long to wait for the browser's disconnect event after polling saw a drop
 var RING_SIZE = 40;               // raw notifications kept for the drop report
-var RING_DUMP = 12;               // how many of them are logged on a drop
+var RING_TAIL = 24;               // visible characters of the last data shown on a drop
+var LATE_EVENT_MS = 5000;         // a disconnect event this soon after a drop we handled ourselves belongs to the old link
 var REJECT_CHECK_MS = 300;        // a refused acknowledged write only downgrades if the link is still up after this
 var STRIKE_WAIT_MS = 2000;        // a timed-out write counts as a strike only if the link survives this long
 
@@ -240,6 +241,8 @@ export class BleTransport {
     this.info = { deviceName: null, serviceUuid: null, writeUuid: null, notifyUuid: null, allServices: [] };
     this.lastDrop = null;            // stats of the link that ended last (see _linkStats)
     this._logger = opts.logger || defaultLogger;
+    this._clockLogger = this._logger;  // the ring buffer uses the log's own clock
+    this._linkSig = null;              // what the last link looked like, so reconnects only log differences
     this._prefer = opts.prefer || 'auto';   // 'auto' | 'e781' | '18f0'
     this._requestedWrite = opts.writeMode === 'withResponse' || opts.writeMode === 'withoutResponse' ? opts.writeMode : 'auto';
     this._writeTimeoutMs = opts.writeTimeoutMs || WRITE_TIMEOUT_MS;
@@ -359,17 +362,30 @@ export class BleTransport {
     this._teardown();
     try { device.removeEventListener('gattserverdisconnected', this._onGattDisconnect); } catch (e) { /* ignore */ }
     device.addEventListener('gattserverdisconnected', this._onGattDisconnect);
+    // A reconnect is quiet: its step by step lines are kept back and only written to the log
+    // when it fails. When it works, only warnings and lines that differ from the last link appear.
+    var real = this._logger;
+    var buf = [];
+    this._logger = { log: function (kind, text) { buf.push([kind, text]); } };
     this._logger.log('info', 'Reconnecting to ' + (device.name || 'adapter') + '...');
+    var prevSig = this._linkSig;
     try {
       await this._setupWithRetry(device, true);
     } catch (e) {
+      this._logger = real;
+      buf.forEach(function (b) { real.log(b[0], '(reconnect) ' + b[1]); });
       this._teardown();
       try { if (device.gatt && device.gatt.connected) device.gatt.disconnect(); } catch (e2) { /* ignore */ }
       this._disconnectReported = false;
       throw e;
     }
-    this._logger.log('info', 'Reconnected.');
-    this._logTally();
+    this._logger = real;
+    var sig = this._linkSig || {};
+    buf.forEach(function (b) {
+      if (b[0] === 'warn' || b[0] === 'error') { real.log(b[0], '(reconnect) ' + b[1]); return; }
+      var key = /^Using notify /.test(b[1]) ? 'using' : /^Write method /.test(b[1]) ? 'method' : null;
+      if (key && (!prevSig || prevSig[key] !== sig[key])) real.log('info', 'Changed on this link: ' + b[1]);
+    });
     return this.info;
   }
 
@@ -430,10 +446,13 @@ export class BleTransport {
     this._writeProps = pick.write.props;
     this._writeMode = chooseWriteMode(this._requestedWrite, pick.write.props, this._writeChar, this._downgraded);
     if (pick.pair) this._lastPair = pick.pair;
-    this._logger.log('info', 'Using notify ' + pick.notify.uuid + ' and write ' + pick.write.uuid +
-      ' in service ' + pick.write.service + ' (' + pick.reason + ', write mode ' + writeModeLabel(this._writeMode) + ')');
-    this._logger.log('info', 'Write method ' + writeMethodName(this._writeMode) + ' (write mode setting: ' + this._requestedWrite +
-      (this._downgraded && this._requestedWrite === 'auto' ? ', acknowledged writes switched off earlier this session' : '') + ').');
+    var usingLine = 'Using notify ' + pick.notify.uuid + ' and write ' + pick.write.uuid +
+      ' in service ' + pick.write.service + ' (' + pick.reason + ', write mode ' + writeModeLabel(this._writeMode) + ')';
+    var methodLine = 'Write method ' + writeMethodName(this._writeMode) + ' (write mode setting: ' + this._requestedWrite +
+      (this._downgraded && this._requestedWrite === 'auto' ? ', acknowledged writes switched off earlier this session' : '') + ').';
+    this._logger.log('info', usingLine);
+    this._logger.log('info', methodLine);
+    this._linkSig = { using: usingLine, method: methodLine };
 
     // Exactly one notify subscription per link. The handler is tied to this link, so a late
     // event from an old characteristic can never reach the app.
@@ -443,6 +462,7 @@ export class BleTransport {
     this._notifyHandler = handler;
     this._notifyChar.addEventListener('characteristicvaluechanged', handler);
     this._partial = '';
+    this._ring = []; // a new link starts with an empty radio trace
     this._link = {
       id: linkId, gattAt: gattAt, upAt: null, commands: 0, rxBytes: 0, lastRxAt: null,
       dropHandled: false, pollClosedAt: null, pollWait: null, ackConfirmed: false
@@ -458,7 +478,6 @@ export class BleTransport {
     }
     this._link.upAt = nowMs();
     this._session.links++;
-    this._lateEvent = null;
     this._connected = true;
     this._startPolling();
   }
@@ -642,7 +661,7 @@ export class BleTransport {
     var now = nowMs();
     var raw = '';
     for (var i = 0; i < dv.byteLength; i++) raw += String.fromCharCode(dv.getUint8(i));
-    this._ring.push({ t: now / 1000, n: dv.byteLength, text: raw });
+    this._ring.push({ t: this._clock() / 1000, n: dv.byteLength, text: raw });
     if (this._ring.length > RING_SIZE) this._ring.splice(0, this._ring.length - RING_SIZE);
     link.rxBytes += dv.byteLength;
     link.lastRxAt = now;
@@ -691,7 +710,16 @@ export class BleTransport {
 
   _handleGattDisconnect() {
     var link = this._link;
+    var late = this._lateEvent && nowMs() - this._lateEvent.at < LATE_EVENT_MS ? this._lateEvent : null;
+    if (link && link.internalDrop) return; // we are closing this link ourselves (fast stall)
     if (link && link.upAt != null && !link.dropHandled) {
+      // An event that arrives while the current link still reports itself connected belongs to
+      // the link we dropped before. The current link is fine.
+      if (late && this._server && this._server.connected) {
+        this._lateEvent = null;
+        if (!late.internal) this._logEventLate(late);
+        return;
+      }
       if (link.pollClosedAt) {
         if (link.pollWait) { clearTimeout(link.pollWait); link.pollWait = null; }
         this._logger.log('info', 'Link reported closed by polling, ' + Math.round(nowMs() - link.pollClosedAt) +
@@ -701,14 +729,13 @@ export class BleTransport {
       return;
     }
     if (link && link.dropHandled) return;
-    if (this._lateEvent) {
-      // The drop was already handled after polling saw it. This is the browser catching up.
-      var late = this._lateEvent;
+    if (late) {
+      // The drop was already handled (by polling or a fast stall). This is the browser catching up.
       this._lateEvent = null;
-      this._logger.log('info', 'The browser\'s disconnect event arrived ' + Math.round(nowMs() - late.at) +
-        ' ms after polling saw the link close (already handled).');
+      if (!late.internal) this._logEventLate(late);
       return;
     }
+    this._lateEvent = null;
     // No link is up yet: the drop happened during setup.
     var wasUser = this._userDisconnect;
     this._teardown();
@@ -716,6 +743,26 @@ export class BleTransport {
     this._reportDisconnect(wasUser
       ? 'Disconnected.'
       : 'The adapter disconnected. It may have lost power, gone out of range, or the car went to sleep. Tap Connect to try again.');
+  }
+
+  _logEventLate(late) {
+    this._logger.log('info', 'The browser\'s disconnect event arrived ' + Math.round(nowMs() - late.at) +
+      ' ms after polling saw the link close (already handled).');
+  }
+
+  // Fast stall: the adapter went quiet mid-reply. Close the link ourselves instead of waiting
+  // about 3 s for the phone to notice. This is not a user disconnect: the app reconnects at once.
+  // Returns true when a drop was started.
+  dropNow(why) {
+    var link = this._link;
+    if (!link || link.upAt == null || link.dropHandled || this._userDisconnect) return false;
+    link.internalDrop = true;
+    this._lateEvent = { at: nowMs(), internal: true };
+    var dev = this._device;
+    try { if (dev && dev.gatt && dev.gatt.connected) dev.gatt.disconnect(); } catch (e) { /* ignore */ }
+    link.internalWhy = why || null;
+    this._dropOnce(link);
+    return true;
   }
 
   // Runs the drop handling for one link, exactly once.
@@ -730,7 +777,8 @@ export class BleTransport {
       this._dumpRing();
     }
     this._teardown();
-    this._logger.log(wasUser ? 'info' : 'warn', wasUser ? 'Disconnected from adapter.' : 'Adapter connection lost.');
+    // An unexpected drop is described by the app in one line (with the drop details).
+    if (wasUser) this._logger.log('info', 'Disconnected from adapter.');
     this._reportDisconnect(wasUser
       ? 'Disconnected.'
       : 'The adapter disconnected. It may have lost power, gone out of range, or the car went to sleep. Tap Connect to try again.');
@@ -750,27 +798,37 @@ export class BleTransport {
     };
   }
 
+  // Milliseconds on the debug log's clock.
+  _clock() {
+    var l = this._clockLogger;
+    return l && typeof l.now === 'function' ? l.now() : nowMs();
+  }
+
+  // One line about the last data of this link, plus the unfinished reply if there is one.
   _dumpRing() {
-    var last = this._ring.slice(-RING_DUMP);
-    if (!last.length) {
-      this._logger.log('warn', 'Last data before the drop: nothing was received.');
-    }
-    for (var i = 0; i < last.length; i++) {
-      var r = last[i];
-      this._logger.log('warn', 'Last data before the drop: at ' + r.t.toFixed(3) + ' s, ' + r.n + ' byte' + (r.n === 1 ? '' : 's') +
-        ', "' + visibleText(r.text) + '"');
+    var last = this._ring[this._ring.length - 1];
+    if (!last) {
+      this._logger.log('warn', 'Last data before the drop: nothing was received on this link.');
+    } else {
+      var tail = '';
+      for (var i = this._ring.length - 1; i >= 0 && tail.length < RING_TAIL + 8; i--) tail = visibleText(this._ring[i].text) + tail;
+      var cut = tail.length > RING_TAIL ? '\u2026' + tail.slice(-RING_TAIL) : tail;
+      this._logger.log('warn', 'Last data before the drop: ' + last.n + ' byte' + (last.n === 1 ? '' : 's') + ' at ' +
+        last.t.toFixed(3) + ' s, ending "' + cut + '"');
     }
     if (this._partial && this._partial.replace(/\s/g, '')) {
       this._logger.log('warn', 'Partial reply at the drop: "' + visibleText(this._partial) + '"');
     }
   }
 
-  _logTally() {
-    var s = this._session;
-    var t = s.connectedMs + (this._link && this._link.upAt != null ? nowMs() - this._link.gattAt : 0);
-    this._logger.log('info', 'Links so far: ' + s.links + ', drops: ' + s.drops + ', connected time: ' + secs(t) +
-      ' s, average ' + (s.drops ? secs(t / s.drops) + ' s per drop' : 'not available yet (no drops)') +
-      ', write mode ' + writeModeLabel(this._writeMode) + (this._downgraded ? ' (acknowledged writes switched off this session)' : ''));
+  // The radio trace kept in memory (last 40 notifications on this link), oldest first.
+  radioTrace() {
+    return this._ring.map(function (r) { return { t: r.t, n: r.n, text: visibleText(r.text) }; });
+  }
+
+  // The write mode in force, for log lines.
+  writeModeText() {
+    return writeModeLabel(this._writeMode) + (this._downgraded ? ' (acknowledged writes switched off this session)' : '');
   }
 
   // Session counters, also used by tests.

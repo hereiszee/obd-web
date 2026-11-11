@@ -1,25 +1,22 @@
-// Reads the adapter's Device Information (firmware version and so on) at most once per page
-// session, and keeps the result for the Connect card, the report and the Probe table.
+// Reads the adapter's Device Information (firmware version and so on) once per page session,
+// and keeps the result for the Connect card, the report and the Probe table.
 //
-// Rules:
-// - Only armed on the first user-started connection. Never on automatic reconnects.
-// - Waits until the link has been healthy and quiet for quietMs (5 s), counted after the car
-//   conversation is set up. Any unhealthy moment, user action or live data restarts the wait.
-// - Never reads while live data runs. If live data starts first, the read waits until it stops.
-// - A drop before the read cancels it for that link.
+// Rules (1.3.0):
+// - Read on the first link that has stayed up for linkUpMs (8 s), at a moment when no command
+//   is pending and live data is not running.
+// - If a drop interrupts the read, try again on a later link. At most one successful read per
+//   page session.
 
 export class AdapterInfoGate {
   constructor(opts) {
     opts = opts || {};
-    this.quietMs = opts.quietMs != null ? opts.quietMs : 5000;
+    this.linkUpMs = opts.linkUpMs != null ? opts.linkUpMs : 8000;
     this.checkMs = opts.checkMs != null ? opts.checkMs : 500;
     this._logger = opts.logger || null;
     this._cache = null;        // {deviceName, info}
-    this._attempted = false;
     this._reading = null;      // promise while a read runs
     this._ctx = null;
     this._timer = null;
-    this._quietSince = null;
     this._postponedLogged = false;
   }
 
@@ -34,19 +31,18 @@ export class AdapterInfoGate {
 
   isReading() { return !!this._reading; }
 
-  // ctx: {transport, deviceName, reconnect, isHealthy(), isLive(), readyToRead(), beforeRead(), afterRead(), onDone(info)}
-  // Returns true when a read was scheduled.
+  isDone() { return !!this._cache; }
+
+  // ctx: {transport, deviceName, linkAgeMs(), isHealthy(), isLive(), readyToRead(), sameLink(),
+  //       beforeRead(), afterRead(), onDone(info)}. Call on every new link. Returns true when armed.
   arm(ctx) {
-    if (!ctx || ctx.reconnect || this._cache || this._attempted || this._reading) return false;
+    if (!ctx || this._cache || this._reading) return false;
     if (!ctx.transport || typeof ctx.transport.readDeviceInfo !== 'function') return false;
     this.cancel();
     this._ctx = ctx;
-    this._quietSince = null;
-    this._postponedLogged = false;
     var self = this;
     this._timer = setInterval(function () { self._check(); }, this.checkMs);
     if (this._timer && typeof this._timer === 'object' && typeof this._timer.unref === 'function') this._timer.unref();
-    this._log('info', 'Adapter info will be read once, after the link has been quiet and healthy for ' + Math.round(this.quietMs / 1000) + ' s.');
     return true;
   }
 
@@ -55,56 +51,55 @@ export class AdapterInfoGate {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
     this._ctx = null;
-    this._quietSince = null;
   }
 
   _check() {
     var ctx = this._ctx;
     if (!ctx) return;
-    var now = Date.now();
-    if (!ctx.isHealthy()) { this._quietSince = null; return; }
+    if (ctx.isHealthy && !ctx.isHealthy()) return;
+    if (ctx.linkAgeMs() < this.linkUpMs) return;
     if (ctx.isLive()) {
-      this._quietSince = null;
       if (!this._postponedLogged) {
         this._postponedLogged = true;
         this._log('info', 'Adapter info read postponed until live data stops.');
       }
       return;
     }
-    if (this._quietSince === null) { this._quietSince = now; return; }
-    if (now - this._quietSince < this.quietMs) return;
-    // Window reached. Read only at a moment when no command is in flight.
     if (typeof ctx.readyToRead === 'function' && !ctx.readyToRead()) return;
     this._start(ctx);
   }
 
   _start(ctx) {
     this.cancel();
-    this._attempted = true;
     var self = this;
     var t = ctx.transport;
     this._log('info', 'Reading adapter info (once per session)...');
     try { if (ctx.beforeRead) ctx.beforeRead(); } catch (e) { /* ignore */ }
     var p = Promise.resolve().then(function () { return t.readDeviceInfo(); }).then(function (info) {
+      // A drop during the read gives an incomplete answer. Keep nothing and try on a later link.
+      if (typeof ctx.sameLink === 'function' && !ctx.sameLink()) {
+        self._log('info', 'Adapter info read was interrupted by a drop. Will try again on a later link.');
+        return null;
+      }
       self._cache = { deviceName: ctx.deviceName != null ? ctx.deviceName : null, info: info || null };
       return info || null;
     }, function () { return null; });
     this._reading = p.then(function (info) {
       self._reading = null;
       try { if (ctx.afterRead) ctx.afterRead(); } catch (e) { /* ignore */ }
-      try { if (ctx.onDone) ctx.onDone(info); } catch (e) { /* ignore */ }
+      if (info) { try { if (ctx.onDone) ctx.onDone(info); } catch (e) { /* ignore */ } }
       return info;
     });
     return this._reading;
   }
 
-  // Probe button: returns the cached info, joins a running read, or reads now (counts as the
-  // one read of the session) when nothing was read yet.
+  // Probe button: returns the cached info, joins a running read, or reads now when nothing
+  // was read successfully yet.
   readNow(ctx) {
     var cached = this.get(ctx && ctx.deviceName);
-    if (cached || (this._cache && this._attempted)) return Promise.resolve(cached);
+    if (cached || this._cache) return Promise.resolve(cached);
     if (this._reading) return this._reading;
-    if (this._attempted || !ctx || !ctx.transport || typeof ctx.transport.readDeviceInfo !== 'function') return Promise.resolve(null);
+    if (!ctx || !ctx.transport || typeof ctx.transport.readDeviceInfo !== 'function') return Promise.resolve(null);
     return this._start(ctx);
   }
 }

@@ -61,7 +61,7 @@ async function runTestFiles() {
 async function runImportChecks() {
   console.log('\n== module import checks');
   // Modules that must load in node without any browser globals.
-  const pure = ['log.js', 'elm.js', 'obd.js', 'pids.js', 'dtc-db.js', 'sim.js', 'report.js', 'ui-text.js', 'ble.js'];
+  const pure = ['log.js', 'elm.js', 'obd.js', 'pids.js', 'dtc-db.js', 'sim.js', 'report.js', 'ui-text.js', 'ble.js', 'adapter-info.js'];
   for (const f of pure) {
     await test('import js/' + f, async () => {
       const m = await import(jsUrl(f));

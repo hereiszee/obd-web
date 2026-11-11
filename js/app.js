@@ -1,16 +1,17 @@
 // OBD Web UI and wiring. All data stays in memory on this page.
 
-import { logger } from './log.js?v=1.1.0';
-import { BleTransport, DEVICE_INFO_FIELDS } from './ble.js?v=1.1.0';
-import { SimTransport } from './sim.js?v=1.1.0';
-import { Elm327 } from './elm.js?v=1.1.0';
-import { Obd, ecuLabel, parseLines } from './obd.js?v=1.1.0';
-import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.1.0';
-import { describeDtc } from './dtc-db.js?v=1.1.0';
-import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.1.0';
-import { buildReport } from './report.js?v=1.1.0';
+import { logger, describeUserAgent } from './log.js?v=1.2.0';
+import { BleTransport, DEVICE_INFO_FIELDS } from './ble.js?v=1.2.0';
+import { AdapterInfoGate } from './adapter-info.js?v=1.2.0';
+import { SimTransport } from './sim.js?v=1.2.0';
+import { Elm327 } from './elm.js?v=1.2.0';
+import { Obd, ecuLabel, parseLines } from './obd.js?v=1.2.0';
+import { PIDS, GAUGE_DEFAULTS } from './pids.js?v=1.2.0';
+import { describeDtc } from './dtc-db.js?v=1.2.0';
+import { TEXT, CODE_KINDS, SEVERITY_LABEL } from './ui-text.js?v=1.2.0';
+import { buildReport } from './report.js?v=1.2.0';
 
-var APP_VERSION = '1.1.0';
+var APP_VERSION = '1.2.0';
 var BITMAP_PIDS = [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
 var SKIP_LIVE_PIDS = [0x01, 0x41]; // status bitfields, shown in readiness instead
 var SCENARIO_LABELS = { normal: 'Normal car', ignitionOff: 'Ignition off', legacy: 'Older car (pre CAN)' };
@@ -30,8 +31,12 @@ var S = {
   init: null,
   supported: null,
   live: { running: false, promise: null, gen: 0, error: null, selected: [], values: {}, tiles: {}, openPid: null, gapMs: 0, drops: 0 },
-  results: { check: null, vin: null, codes: null, readiness: null, freeze: null }
+  results: { check: null, vin: null, codes: null, readiness: null, freeze: null },
+  simAdapterInfo: null
 };
+
+// Bluetooth Device Information is read at most once per page session (see js/adapter-info.js).
+var adapterInfo = new AdapterInfoGate({ logger: logger });
 
 // ---------------------------------------------------------------- helpers
 
@@ -245,7 +250,7 @@ function updateButtons() {
   var lb = $('btnLive');
   lb.textContent = live ? 'Stop live data' : (stopping ? 'Stopping...' : 'Start live data');
   lb.className = live ? 'btn btn-danger' : 'btn btn-primary';
-  setDisabled('btnLive', live ? false : (stopping || !S.connected || S.busy || S.live.selected.length === 0));
+  setDisabled('btnLive', live ? false : (stopping || !S.connected || S.busy || adapterInfo.isReading() || S.live.selected.length === 0));
 
   // Explain why the main tools are greyed out, once, in the live card.
   if (live) setMsg($('liveMsg'), 'info', null, TEXT.live.stopFirst);
@@ -395,6 +400,7 @@ function talkToCar() {
       setStatus('warn', 'The adapter is connected, but the car did not answer.');
       setMsg($('connectMsg'), 'warn', 'The car is not answering yet',
         (r && r.message ? r.message + ' You can use the "Ask the car again" button below without reconnecting the adapter.' : null) || 'Turn the ignition ON (or press start with your foot on the brake until READY shows), check the adapter is pushed fully into the port, then tap "Ask the car again".');
+      armAdapterInfo(t);
       return;
     }
     S.adapterOnly = false;
@@ -424,7 +430,7 @@ function talkToCar() {
         // connection dropped and this is an automatic reconnect.
         if (!S.reconnecting || !S.live.selected.length) setupLive();
         if (S.kind === 'ble') { keepAwake(true); if (S.elm) S.elm.startKeepAlive(1500); }
-        readAdapterInfo(t);
+        armAdapterInfo(t);
       });
   });
 }
@@ -434,14 +440,47 @@ function onRetry() {
   run('Asking the car again', talkToCar, $('connectMsg'));
 }
 
-// Reads the adapter's firmware version and similar fields once per new connection.
-// Bluetooth reads do not go through the ELM327 command queue, so they do not disturb it.
-function readAdapterInfo(t) {
-  if (!t || typeof t.readDeviceInfo !== 'function' || (t.info && t.info.deviceInfo)) return Promise.resolve();
-  return t.readDeviceInfo().then(function (di) {
-    logAdapterInfo(di);
-    if (S.transport === t) renderConnectInfo();
-  }, function () {});
+// Schedules the one Device Information read of this page session. Bluetooth reads do not
+// go through the ELM327 command queue. They wait for a quiet, healthy link (see adapter-info.js).
+function armAdapterInfo(t) {
+  if (!t) return;
+  if (S.kind === 'sim') {
+    // No Bluetooth involved. Read the simulated values straight away.
+    if (!S.simAdapterInfo && typeof t.readDeviceInfo === 'function') {
+      Promise.resolve(t.readDeviceInfo()).then(function (di) {
+        S.simAdapterInfo = di || null;
+        logAdapterInfo(di);
+        if (S.transport === t) renderConnectInfo();
+      }, function () {});
+    }
+    return;
+  }
+  adapterInfo.arm({
+    transport: t,
+    deviceName: t.info && t.info.deviceName,
+    reconnect: !!S.reconnecting,
+    isHealthy: function () {
+      return S.transport === t && t.isConnected() && !S.reconnecting && !S.busy && (S.connected || S.adapterOnly);
+    },
+    isLive: function () { return S.live.running || !!S.live.promise; },
+    readyToRead: function () { return !!S.elm && S.elm.idleMs() >= 100; },
+    beforeRead: function () { if (S.elm) S.elm.stopKeepAlive(); updateButtons(); },
+    afterRead: function () {
+      if (S.transport === t && S.elm && t.isConnected() && (S.connected || S.adapterOnly)) S.elm.startKeepAlive(1500);
+      updateButtons();
+    },
+    onDone: function (di) {
+      logAdapterInfo(di);
+      if (S.transport === t) renderConnectInfo();
+    }
+  });
+}
+
+// The cached adapter info for the current connection, or null.
+function currentAdapterInfo() {
+  if (S.kind === 'sim') return S.simAdapterInfo;
+  var info = (S.transport && S.transport.info) || {};
+  return adapterInfo.get(info.deviceName);
 }
 
 function adapterInfoRows(di) {
@@ -464,7 +503,7 @@ function renderConnectInfo() {
   var rows = [];
   rows.push(['Source', S.kind === 'sim' ? 'Simulated car (' + (SCENARIO_LABELS[S.scenario] || SCENARIO_LABELS.normal) + ')' : (info.deviceName || 'Bluetooth adapter')]);
   if (r.elmVersion) rows.push(['Adapter chip', r.elmVersion + ' (the ELM327 command set it imitates, not its firmware)']);
-  var di = info.deviceInfo;
+  var di = currentAdapterInfo();
   if (di && di.firmware) rows.push(['Adapter firmware', di.firmware]);
   if (di && di.hardware) rows.push(['Adapter hardware', di.hardware]);
   // 'AUTO' alone means no protocol was found yet, which tells the user nothing.
@@ -501,15 +540,16 @@ function onDisconnectClick() {
 function onTransportLost(t, reason) {
   if (S.transport !== t) return;
   var user = S.userDisconnecting;
-  // A drop while auto-reconnecting is handled by the retry loop itself.
-  if (S.reconnecting && !user) return;
   var wasLive = S.live.running;
+  adapterInfo.cancel();
   try {
     var idle = S.elm ? Math.round(S.elm.idleMs() / 100) / 10 : null;
     var rpm = S.live.values[0x0C];
     var eng = rpm && typeof rpm.value === 'number' ? ', last engine speed ' + Math.round(rpm.value) + ' rpm (' + Math.round((Date.now() - rpm.at) / 100) / 10 + ' s ago)' : '';
-    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + eng + '.');
+    logger.log('warn', 'Drop details: page ' + (document.visibilityState || '?') + ', adapter idle ' + (idle === null ? '?' : idle + ' s') + (wasLive ? ', live data was running' : '') + eng + linkDetails(t) + '.');
   } catch (e) { /* logging only */ }
+  // A drop while auto-reconnecting is handled by the retry loop itself.
+  if (S.reconnecting && !user) return;
   try { if (S.elm) S.elm.stopKeepAlive(); } catch (e) { /* ignore */ }
   S.live.running = false;
   try { if (S.elm) S.elm.cancelAll(); } catch (e) { /* ignore */ }
@@ -524,6 +564,18 @@ function onTransportLost(t, reason) {
     setMsg($('connectMsg'), 'bad', 'Connection lost',
       (reason ? String(reason) + ' ' : '') + 'This happens if the car turns off, the adapter is unplugged, or the phone moves out of range. Your results so far are kept. Tap Connect adapter to reconnect.');
   }
+}
+
+// Link facts from the transport for the "Drop details" line. Empty for the simulator.
+function linkDetails(t) {
+  var d = t && t.lastDrop;
+  if (!d) return '';
+  t.lastDrop = null; // each link is described once
+  function s1(x) { return (Math.round(x * 10) / 10).toFixed(1); }
+  return ', link up ' + s1(d.secondsSinceConnect) + ' s since GATT connect, channel ' + d.channel +
+    ', write mode ' + d.writeModeText + ', ' + d.commands + ' command' + (d.commands === 1 ? '' : 's') + ' sent, ' +
+    d.rxBytes + ' byte' + (d.rxBytes === 1 ? '' : 's') + ' received, ' +
+    (d.secondsSinceLastRx == null ? 'no data received on this link' : 'last byte ' + s1(d.secondsSinceLastRx) + ' s before the drop');
 }
 
 var RECONNECT_DELAYS = [250, 1500, 2500, 4000, 6000, 8000];
@@ -661,20 +713,46 @@ function autoReconnect(t, wasLive, reason) {
 
 // Keep the screen on while connected. iOS can drop Bluetooth when the phone locks.
 var wakeLock = null;
+var screenDimOff = false; // true while Bluefy's own "do not dim" setting is in use
 function keepAwake(on) {
   try {
     if (on) {
-      if (wakeLock || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+      if (wakeLock || screenDimOff || document.visibilityState !== 'visible') return;
+      if (!navigator.wakeLock) { bluefyNoDim(); return; }
       navigator.wakeLock.request('screen').then(function (l) {
         wakeLock = l;
         logger.log('info', 'Screen will stay on while connected.');
         l.addEventListener('release', function () { wakeLock = null; });
-      }, function (e) { logger.log('info', 'Screen wake lock not available: ' + errMsg(e)); });
-    } else if (wakeLock) {
-      var l = wakeLock; wakeLock = null;
-      l.release().catch(function () {});
+      }, function (e) {
+        logger.log('info', 'Screen wake lock not available: ' + errMsg(e));
+        bluefyNoDim();
+      }).catch(function () {});
+    } else {
+      if (wakeLock) {
+        var l = wakeLock; wakeLock = null;
+        l.release().catch(function () {});
+      }
+      if (screenDimOff) {
+        screenDimOff = false;
+        try {
+          var r = navigator.bluetooth.setScreenDimEnabled(true);
+          if (r && typeof r.catch === 'function') r.catch(function () {});
+        } catch (e2) { /* ignore */ }
+      }
     }
   } catch (e) { /* not supported */ }
+}
+
+// Bluefy denies the Wake Lock API but has its own setting to stop the screen dimming.
+function bluefyNoDim() {
+  try {
+    var bt = navigator.bluetooth;
+    if (screenDimOff || !bt || typeof bt.setScreenDimEnabled !== 'function') return;
+    var r = bt.setScreenDimEnabled(false);
+    if (r && typeof r.catch === 'function') r.catch(function () {});
+    screenDimOff = true;
+    logger.log('info', 'Screen will stay on while connected (Bluefy setting).');
+  } catch (e) { /* never throw from here */ }
 }
 
 function dropTransport(t, text, kind) {
@@ -713,9 +791,19 @@ function onProbe() {
       });
       out.appendChild(table);
       var t = S.transport;
-      var p2 = t && typeof t.readDeviceInfo === 'function' ? t.readDeviceInfo() : Promise.resolve(null);
-      return p2.then(function (di) {
-        if (di) logAdapterInfo(di);
+      // The full Bluetooth service list, for the log. Nothing is read or changed.
+      var p1 = t && typeof t.listServices === 'function' ? Promise.resolve(t.listServices()).catch(function (e) {
+        logger.log('warn', 'Listing Bluetooth services failed: ' + errMsg(e));
+      }) : Promise.resolve();
+      return p1.then(function () {
+        if (!t) return null;
+        if (S.kind === 'sim') return S.simAdapterInfo || Promise.resolve(t.readDeviceInfo ? t.readDeviceInfo() : null).then(function (d) { S.simAdapterInfo = d || null; logAdapterInfo(d); return d; });
+        // Uses the cached result. Reads only if nothing was read yet this session.
+        return adapterInfo.readNow({ transport: t, deviceName: t.info && t.info.deviceName }).then(function (d) {
+          if (d) logAdapterInfo(d);
+          return d;
+        });
+      }).then(function (di) {
         var rows = adapterInfoRows(di);
         if (rows.length) {
           out.appendChild(h('h3', { text: 'Adapter details' }));
@@ -1303,6 +1391,7 @@ function onLiveToggle() {
   // A previous loop is still finishing its last request: wait for it (the button is disabled meanwhile).
   if (S.live.promise) return;
   if (!S.connected || S.busy || !S.live.selected.length) return;
+  if (adapterInfo.isReading()) return; // a one-off Bluetooth read, takes about a second
   var gen = ++S.live.gen;
   var lm = $('liveMode');
   if (S.obd) S.obd.gentleLive = !lm || lm.value !== 'fast';
@@ -1370,7 +1459,7 @@ function onBuildReport() {
         scenario: S.scenario,
         deviceName: info.deviceName || null,
         elmVersion: init.elmVersion || null,
-        deviceInfo: info.deviceInfo || null,
+        deviceInfo: currentAdapterInfo() || null,
         protocol: init.protocol || null,
         protocolNumber: init.protocolNumber || null,
         voltage: init.voltage ? voltText(init.voltage) : null
@@ -1540,6 +1629,17 @@ function boot() {
   updateButtons();
   setStatus('idle', 'Not connected. Follow the steps under "How this works" if this is your first time, then tap Connect adapter.');
   logger.log('info', 'OBD Web ' + APP_VERSION + ' loaded. Web Bluetooth ' + (navigator.bluetooth ? 'available' : 'not available') + '.');
+  logBrowser();
+}
+
+// Browser and OS versions for the debug log. Stays on this page like everything else.
+function logBrowser() {
+  var ua = '';
+  try { ua = String(navigator.userAgent || ''); } catch (e) { ua = ''; }
+  var desc = null;
+  try { desc = describeUserAgent(ua); } catch (e) { desc = null; }
+  if (desc) logger.log('info', 'Browser: ' + desc);
+  logger.log('info', 'User agent: ' + (ua || '(empty)'));
 }
 
 window.addEventListener('error', function (e) {

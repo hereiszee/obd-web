@@ -80,3 +80,31 @@ export class Logger {
 }
 
 export const logger = new Logger();
+
+// Turns a user agent string into "Bluefy 3.5 on iOS 18.6" style text, or null if it cannot.
+// Only used for the debug log. Note: recent iOS versions freeze the OS number in the user agent,
+// so the iOS version shown may be lower than the real one.
+export function describeUserAgent(ua) {
+  var s = String(ua || '');
+  if (!s) return null;
+  function ver(re) { var m = re.exec(s); return m ? m[1].replace(/_/g, '.') : null; }
+  var os = null;
+  var v;
+  if ((v = ver(/(?:iPhone|CPU) OS (\d+(?:[._]\d+)*)/))) os = 'iOS ' + v;
+  else if (/iPad/.test(s) && (v = ver(/OS (\d+(?:[._]\d+)*)/))) os = 'iPadOS ' + v;
+  else if ((v = ver(/Android (\d+(?:\.\d+)*)/))) os = 'Android ' + v;
+  else if ((v = ver(/Mac OS X (\d+(?:[._]\d+)*)/))) os = 'macOS ' + v;
+  else if ((v = ver(/Windows NT (\d+(?:\.\d+)*)/))) os = 'Windows NT ' + v;
+  else if (/CrOS/.test(s)) os = 'ChromeOS';
+  else if (/Linux/.test(s)) os = 'Linux';
+  var browser = null;
+  if ((v = ver(/Bluefy\/(\d+(?:\.\d+)*)/i))) browser = 'Bluefy ' + v;
+  else if ((v = ver(/EdgiOS\/(\d+(?:\.\d+)*)/)) || (v = ver(/Edg\/(\d+(?:\.\d+)*)/))) browser = 'Edge ' + v;
+  else if ((v = ver(/CriOS\/(\d+(?:\.\d+)*)/))) browser = 'Chrome ' + v;
+  else if ((v = ver(/FxiOS\/(\d+(?:\.\d+)*)/)) || (v = ver(/Firefox\/(\d+(?:\.\d+)*)/))) browser = 'Firefox ' + v;
+  else if ((v = ver(/Chrome\/(\d+(?:\.\d+)*)/))) browser = 'Chrome ' + v;
+  else if (/AppleWebKit/.test(s) && /Mobile\//.test(s) && !/Safari\//.test(s)) browser = 'iOS app browser (WebKit, name not in user agent)';
+  else if ((v = ver(/Version\/(\d+(?:\.\d+)*).*Safari\//))) browser = 'Safari ' + v + ' (or a browser that reports as Safari)';
+  if (!browser || !os) return null;
+  return browser + ' on ' + os;
+}

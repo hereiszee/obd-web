@@ -11,7 +11,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>OBD Web</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M14 40a18 18 0 0 1 36 0' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M32 40l9-11' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='40' r='4' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="css/app.css?v=1.1.0">
+  <link rel="stylesheet" href="css/app.css?v=1.2.0">
 </head>
 <body>
   <header class="topbar">
@@ -63,14 +63,15 @@
         <summary>Bluetooth channel (advanced)</summary>
         <p class="muted small">Some adapters offer more than one Bluetooth channel. If the connection keeps dropping, pick the other one, then tap Connect adapter again.</p>
         <select id="bleChannel" class="select">
-          <option value="auto">Automatic (recommended)</option>
-          <option value="e781">iOS channel (E7810A71)</option>
+          <option value="auto">Automatic (recommended, main channel first)</option>
           <option value="18f0">Main channel (18F0)</option>
+          <option value="e781">iOS channel (E7810A71)</option>
         </select>
-        <p class="muted small">Write mode. "Acknowledged" is a little slower but the adapter confirms every message.</p>
+        <p class="muted small">Write mode. Automatic uses "Acknowledged" when the adapter allows it. The adapter confirms every message before the next one is sent. "Unacknowledged" is the faster mode used before version 1.2.0, kept for comparison.</p>
         <select id="bleWrite" class="select">
           <option value="auto">Automatic (recommended)</option>
           <option value="withResponse">Acknowledged</option>
+          <option value="withoutResponse">Unacknowledged (old behaviour)</option>
         </select>
       </details>
       <div data-explain="connect"></div>
@@ -213,6 +214,6 @@
   </div>
 
   <noscript><p class="wrap">This page needs JavaScript turned on. It still never sends your data anywhere.</p></noscript>
-  <script type="module" src="js/app.js?v=1.1.0"></script>
+  <script type="module" src="js/app.js?v=1.2.0"></script>
 </body>
 </html>

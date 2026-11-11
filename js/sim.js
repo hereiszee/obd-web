@@ -194,6 +194,7 @@ export class SimTransport {
       ]
     };
     this._connected = false;
+    this.lastDrop = null; // BleTransport sets link stats here on a drop. Not used by the simulator.
     this._gen = 0;
     this._timers = [];
     this._busy = false;
@@ -225,6 +226,11 @@ export class SimTransport {
   async readDeviceInfo() {
     this.info.deviceInfo = { manufacturer: 'Simulated adapter', model: 'Sim', hardware: null, firmware: 'sim-1.0', software: null };
     return this.info.deviceInfo;
+  }
+
+  // Same shape as BleTransport.listServices (used by the Probe button).
+  async listServices() {
+    return this.info.allServices;
   }
 
   isConnected() { return this._connected; }

@@ -61,16 +61,22 @@ function fakeBluetooth({ rejectWith, dropOnFirstListOf } = {}) {
   });
   const P = (o) => Object.assign({ read: false, write: false, writeWithoutResponse: false, notify: false, indicate: false }, o);
   let dropped = false;
+  const maybeDrop = (uuid) => {
+    if (dropOnFirstListOf === uuid && !dropped) {
+      dropped = true; gatt.connected = false;
+      (listeners.gattserverdisconnected || []).forEach((f) => f());
+      throw 2;
+    }
+    if (!gatt.connected) throw 2;
+  };
   const svc = (uuid, chars) => ({
     uuid,
-    async getCharacteristics() {
-      if (dropOnFirstListOf === uuid && !dropped) {
-        dropped = true; gatt.connected = false;
-        (listeners.gattserverdisconnected || []).forEach((f) => f());
-        throw 2;
-      }
-      if (!gatt.connected) throw 2;
-      return chars;
+    async getCharacteristics() { maybeDrop(uuid); return chars; },
+    async getCharacteristic(u) {
+      maybeDrop(uuid);
+      const c = chars.find((x) => normUuid(x.uuid) === normUuid(u));
+      if (!c) throw new Error('NotFoundError');
+      return c;
     },
   });
   const services = [
@@ -83,7 +89,15 @@ function fakeBluetooth({ rejectWith, dropOnFirstListOf } = {}) {
     async connect() { connects++; gatt.connected = true; return server; },
     disconnect() { gatt.connected = false; },
   };
-  const server = { get connected() { return gatt.connected; }, async getPrimaryServices() { return services; } };
+  const server = {
+    get connected() { return gatt.connected; },
+    async getPrimaryServices() { return services; },
+    async getPrimaryService(u) {
+      const s = services.find((x) => normUuid(x.uuid) === normUuid(u));
+      if (!s) throw new Error('NotFoundError');
+      return s;
+    },
+  };
   const device = {
     name: 'vLinker MC-IOS', id: 'X', gatt,
     addEventListener(n, f) { (listeners[n] = listeners[n] || []).push(f); },
@@ -134,14 +148,27 @@ export async function run() {
     assert.equal(normUuid('E7810A71-73AE-499D-8C15-FAA9AEF0C3F2'), 'e7810a71-73ae-499d-8c15-faa9aef0c3f2');
   });
 
-  test('BLE: picks the proven vLinker pair with short-UUID services', async () => {
+  test('BLE: picks the 18F0 pair by default with short-UUID services', async () => {
     const fb = fakeBluetooth();
     await withNavigator({ bluetooth: fb.bluetooth }, async () => {
       const t = new BleTransport({ logger: new Logger() });
       const info = await t.connect();
+      assert.equal(info.serviceUuid, '000018f0-0000-1000-8000-00805f9b34fb');
+      assert.equal(info.notifyUuid, '00002af0-0000-1000-8000-00805f9b34fb');
+      assert.equal(info.writeUuid, '00002af1-0000-1000-8000-00805f9b34fb');
+      assert.ok(t.isConnected());
+      await t.disconnect();
+    });
+  });
+
+  test('BLE: the iOS channel can still be chosen explicitly', async () => {
+    const fb = fakeBluetooth();
+    await withNavigator({ bluetooth: fb.bluetooth }, async () => {
+      const t = new BleTransport({ logger: new Logger(), prefer: 'e781' });
+      const info = await t.connect();
       assert.equal(info.serviceUuid, 'e7810a71-73ae-499d-8c15-faa9aef0c3f2');
       assert.equal(info.notifyUuid, 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f');
-      assert.ok(t.isConnected());
+      await t.disconnect();
     });
   });
 
@@ -154,7 +181,7 @@ export async function run() {
   });
 
   test('BLE: link drop during discovery retries and connects', async () => {
-    const fb = fakeBluetooth({ dropOnFirstListOf: 'e7810a71-73ae-499d-8c15-faa9aef0c3f2' });
+    const fb = fakeBluetooth({ dropOnFirstListOf: '18f0' });
     await withNavigator({ bluetooth: fb.bluetooth }, async () => {
       const log = new Logger();
       const t = new BleTransport({ logger: log });
@@ -163,7 +190,7 @@ export async function run() {
       t.onDisconnect = () => { lost++; };
       assert.equal(fb.stats().connects, 2, 'should reconnect once');
       assert.ok(t.isConnected());
-      assert.equal(info.serviceUuid, 'e7810a71-73ae-499d-8c15-faa9aef0c3f2');
+      assert.equal(info.serviceUuid, '000018f0-0000-1000-8000-00805f9b34fb');
       // A later real drop must still reach the app.
       t._handleGattDisconnect();
       assert.equal(lost, 1);

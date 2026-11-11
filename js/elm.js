@@ -1,6 +1,6 @@
 // Elm327: strict one-at-a-time command queue on top of a Transport (BLE or simulated).
 
-import { logger as defaultLogger } from './log.js?v=1.1.0';
+import { logger as defaultLogger } from './log.js?v=1.2.0';
 
 var MESSAGES = {
   nodata: 'The car did not answer this request. This usually means it is not supported by this car.',
@@ -117,6 +117,7 @@ export class Elm327 {
     this.protocolNumber = null;
     this._lastActivity = Date.now();
     this._keepAliveTimer = null;
+    this.stallMs = 1000;   // a pending command with no bytes for longer than this is logged as a stall
     var self = this;
     if (transport) {
       transport.onData = function (chunk) { self._onData(chunk); };
@@ -188,6 +189,21 @@ export class Elm327 {
     return new Promise(function (resolve) {
       var done = false;
       var timer = null;
+      // Stall watch: warn once when a pending command gets no bytes for more than stallMs.
+      var lastByteAt = Date.now();
+      var stalledSince = null;
+      var stallTimer = null;
+      function armStall() {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(function () {
+          stallTimer = null;
+          if (done || stalledSince !== null) return;
+          stalledSince = lastByteAt;
+          self.logger.log('warn', 'Adapter stalled for ' + ((Date.now() - lastByteAt) / 1000).toFixed(1) +
+            ' s (no data while waiting for the reply to ' + cmd + ').');
+        }, self.stallMs + 1);
+        if (stallTimer && typeof stallTimer === 'object' && typeof stallTimer.unref === 'function') stallTimer.unref();
+      }
       var current = {
         cmd: cmd,
         buffer: '',
@@ -195,8 +211,19 @@ export class Elm327 {
           if (done) return;
           done = true;
           if (timer) clearTimeout(timer);
+          if (stallTimer) clearTimeout(stallTimer);
           if (self._current === current) self._current = null;
           resolve(res);
+        },
+        onChunk: function () {
+          var now = Date.now();
+          if (stalledSince !== null) {
+            self.logger.log('info', 'Adapter data resumed after a stall of ' + ((now - stalledSince) / 1000).toFixed(1) +
+              ' s (reply to ' + cmd + ').');
+            stalledSince = null;
+          }
+          lastByteAt = now;
+          if (!done) armStall();
         },
         onPrompt: function (raw) {
           self.logger.log('rx', raw + '>');
@@ -216,6 +243,8 @@ export class Elm327 {
       }, timeout);
 
       self.logger.log('tx', cmd);
+      lastByteAt = Date.now();
+      armStall();
       Promise.resolve().then(function () {
         return self.transport.write(cmd + '\r');
       }).then(null, function (e) {

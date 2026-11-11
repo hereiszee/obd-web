@@ -67,12 +67,15 @@ BleTransport details:
   0xffb0? not needed but harmless, plus 128-bit: 'e7810a71-73ae-499d-8c15-faa9aef0c3f2' (vLinker/OBDLink-style
   "ELM327 BLE" service seen on many clones), '0000fff0-0000-1000-8000-00805f9b34fb' etc, Nordic UART
   '6e400001-b5a3-f393-e0a9-e50e24dcca9e', and Microchip/ISSC transparent UART '49535343-fe7d-4ae5-8fa9-9fafd205e455'.
-- After connect: getPrimaryServices(), for each service getCharacteristics(), log every service/char UUID and
-  properties to logger. Choose notify char (notify or indicate) + write char (writeWithoutResponse preferred, else write),
-  preferring same service, preferring known pairs (FFF1 notify/FFF2 write, FFE1 both, 2AF0 notify/2AF1 write,
-  bef8d6c9-9c21-4c9e-b632-bd58c1009f9f in e7810a71 service).
-- write(): encode ASCII, split into 20-byte chunks, write sequentially (await each). Use writeValueWithoutResponse
-  if supported else writeValueWithResponse else writeValue.
+- After connect (1.2.0): open the known pairs directly with getPrimaryService(uuid) + getCharacteristic(uuid), in
+  order 18F0 (2AF0 notify, 2AF1 write), e7810a71 (bef8d6c9), FFF0, FFE0, Nordic, ISSC. Only if that fails, walk
+  getPrimaryServices()/getCharacteristics() and log every service/char. Reconnects open the pair that worked last time
+  directly. Exactly one notify subscription per link. The Probe button also runs the walk (listServices()).
+- write(): encode ASCII, split into 20-byte chunks, strictly one write in flight (await each, also across messages).
+  Write mode "auto" = writeValueWithResponse when the char has `write` and the method exists, else
+  writeValueWithoutResponse, else writeValue. A write not confirmed within 3 s rejects as a send error.
+- Device Information (180A) is read at most once per page session by the app (js/adapter-info.js), never on reconnects
+  and never during live data.
 - Handle gattserverdisconnected → onDisconnect.
 - If `navigator.bluetooth` missing, throw Error with plain-English message: on iPhone use the Bluefy browser,
   on desktop use Chrome or Edge.
